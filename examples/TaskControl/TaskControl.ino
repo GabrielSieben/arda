@@ -1,10 +1,8 @@
 /*
  * Arda Example: Task Control
  *
- * Demonstrates dynamic task management:
- * - Starting/stopping tasks via serial commands
- * - Pausing/resuming tasks
- * - Querying task status
+ * Demonstrates dynamic task management via serial commands.
+ * Shows how to pause, resume, stop, and start tasks at runtime.
  *
  * Serial Commands:
  *   p <id> - Pause task
@@ -12,124 +10,210 @@
  *   s <id> - Stop task
  *   t <id> - Start task
  *   l      - List all tasks
+ *   h      - Show help
  */
 
 #include "Arda.h"
 
-#define LED_PIN 13
-
 // ============================================
-// Task 1: Fast Blinker (100ms)
+// Task 1: LED Blinker
 // ============================================
-bool led1State = false;
+bool ledState = false;
 
-void fastBlink_setup() {
-    pinMode(LED_PIN, OUTPUT);
+TASK_SETUP(blinker) {
+    pinMode(LED_BUILTIN, OUTPUT);
+    Serial.println(F("[Blinker] Started"));
 }
 
-void fastBlink_loop() {
-    led1State = !led1State;
-    digitalWrite(LED_PIN, led1State ? HIGH : LOW);
+TASK_LOOP(blinker) {
+    ledState = !ledState;
+    digitalWrite(LED_BUILTIN, ledState ? HIGH : LOW);
 }
 
-// ============================================
-// Task 2: Counter
-// ============================================
-uint32_t counter = 0;
-
-void counter_setup() {
-    counter = 0;
-}
-
-void counter_loop() {
-    counter++;
-    Serial.print(F("Count: "));
-    Serial.println(counter);
+TASK_TEARDOWN(blinker) {
+    digitalWrite(LED_BUILTIN, LOW);  // Turn off LED when stopped
+    Serial.println(F("[Blinker] Stopped, LED off"));
 }
 
 // ============================================
-// Task 3: Command Handler (runs every cycle)
+// Task 2: Heartbeat (prints periodically)
 // ============================================
-void commandHandler_setup() {
-    Serial.println(F("Commands: p/r/s/t <id>, l (list)"));
+uint32_t heartbeatCount = 0;
+
+TASK_SETUP(heartbeat) {
+    heartbeatCount = 0;
+    Serial.println(F("[Heartbeat] Started"));
 }
 
-void commandHandler_loop() {
-    if (Serial.available() > 0) {
-        char cmd = Serial.read();
-        int8_t taskId = -1;
+TASK_LOOP(heartbeat) {
+    heartbeatCount++;
+    Serial.print(F("[Heartbeat] #"));
+    Serial.print(heartbeatCount);
+    Serial.print(F(" at "));
+    Serial.print(OS.uptime() / 1000);
+    Serial.println(F("s"));
+}
 
-        // Read task ID if present
-        if (Serial.available() > 0) {
-            Serial.read(); // consume space
-            taskId = Serial.parseInt();
+// ============================================
+// Task 3: Command Handler
+// ============================================
+char cmdBuffer[16];
+uint8_t cmdIndex = 0;
+
+TASK_SETUP(commander) {
+    cmdIndex = 0;
+    printHelp();
+}
+
+TASK_LOOP(commander) {
+    while (Serial.available()) {
+        char c = Serial.read();
+
+        if (c == '\n' || c == '\r') {
+            if (cmdIndex > 0) {
+                cmdBuffer[cmdIndex] = '\0';
+                processCommand();
+                cmdIndex = 0;
+            }
+        } else if (cmdIndex < sizeof(cmdBuffer) - 1) {
+            cmdBuffer[cmdIndex++] = c;
         }
+    }
+}
 
-        switch (cmd) {
-            case 'p':
-                if (OS.pauseTask(taskId)) {
-                    Serial.print(F("Paused task "));
-                    Serial.println(taskId);
-                }
-                break;
+void printHelp() {
+    Serial.println(F("\n=== Commands ==="));
+    Serial.println(F("  p <id> - Pause task"));
+    Serial.println(F("  r <id> - Resume task"));
+    Serial.println(F("  s <id> - Stop task"));
+    Serial.println(F("  t <id> - Start task"));
+    Serial.println(F("  l      - List tasks"));
+    Serial.println(F("  h      - This help"));
+    Serial.println();
+}
 
-            case 'r':
-                if (OS.resumeTask(taskId)) {
-                    Serial.print(F("Resumed task "));
-                    Serial.println(taskId);
-                }
-                break;
+void processCommand() {
+    char cmd = cmdBuffer[0];
+    int8_t taskId = -1;
 
-            case 's':
-                if (OS.stopTask(taskId) != StopResult::Failed) {
+    // Parse task ID if present (skip space after command)
+    if (cmdIndex >= 3 && cmdBuffer[1] == ' ') {
+        // Validate that we have a digit (atoi returns 0 for non-numeric, but 0 is a valid task ID)
+        char firstDigit = cmdBuffer[2];
+        if (firstDigit >= '0' && firstDigit <= '9') {
+            taskId = atoi(&cmdBuffer[2]);
+        }
+    }
+
+    switch (cmd) {
+        case 'p':
+            if (taskId < 0) {
+                Serial.println(F("Usage: p <task_id>"));
+            } else if (OS.pauseTask(taskId)) {
+                Serial.print(F("Paused task "));
+                Serial.println(taskId);
+            } else {
+                Serial.print(F("ERROR: Cannot pause task "));
+                Serial.print(taskId);
+                Serial.print(F(" - "));
+                Serial.println(OS.errorString(OS.getError()));
+            }
+            break;
+
+        case 'r':
+            if (taskId < 0) {
+                Serial.println(F("Usage: r <task_id>"));
+            } else if (OS.resumeTask(taskId)) {
+                Serial.print(F("Resumed task "));
+                Serial.println(taskId);
+            } else {
+                Serial.print(F("ERROR: Cannot resume task "));
+                Serial.print(taskId);
+                Serial.print(F(" - "));
+                Serial.println(OS.errorString(OS.getError()));
+            }
+            break;
+
+        case 's': {
+            if (taskId < 0) {
+                Serial.println(F("Usage: s <task_id>"));
+            } else {
+                StopResult result = OS.stopTask(taskId);
+                if (result == StopResult::Failed) {
+                    Serial.print(F("ERROR: Cannot stop task "));
+                    Serial.print(taskId);
+                    Serial.print(F(" - "));
+                    Serial.println(OS.errorString(OS.getError()));
+                } else {
                     Serial.print(F("Stopped task "));
                     Serial.println(taskId);
+                    if (result == StopResult::TeardownSkipped) {
+                        Serial.println(F("  (teardown skipped)"));
+                    }
                 }
-                break;
-
-            case 't':
-                if (OS.startTask(taskId)) {
-                    Serial.print(F("Started task "));
-                    Serial.println(taskId);
-                }
-                break;
-
-            case 'l':
-                listTasks();
-                break;
+            }
+            break;
         }
 
-        // Clear remaining input
-        while (Serial.available()) Serial.read();
+        case 't':
+            if (taskId < 0) {
+                Serial.println(F("Usage: t <task_id>"));
+            } else if (OS.startTask(taskId)) {
+                Serial.print(F("Started task "));
+                Serial.println(taskId);
+            } else {
+                Serial.print(F("ERROR: Cannot start task "));
+                Serial.print(taskId);
+                Serial.print(F(" - "));
+                Serial.println(OS.errorString(OS.getError()));
+            }
+            break;
+
+        case 'l':
+            listTasks();
+            break;
+
+        case 'h':
+        case '?':
+            printHelp();
+            break;
+
+        default:
+            Serial.print(F("Unknown command: "));
+            Serial.println(cmd);
+            Serial.println(F("Type 'h' for help"));
+            break;
     }
 }
 
 void listTasks() {
-    Serial.println(F("\n=== Task List ==="));
-    // Use getSlotCount() to iterate all slots (including deleted ones)
-    // Using getTaskCount() would skip valid tasks at higher indices
+    Serial.println(F("\n=== Tasks ==="));
+    Serial.println(F("ID  Name        State    Runs"));
+    Serial.println(F("--  ----        -----    ----"));
+
     for (int8_t i = 0; i < OS.getSlotCount(); i++) {
-        if (!OS.isValidTask(i)) {
-            continue;  // Skip deleted slots
-        }
+        if (!OS.isValidTask(i)) continue;
+
+        Serial.print(i);
+        Serial.print(F("   "));
 
         const char* name = OS.getTaskName(i);
-        Serial.print(F("["));
-        Serial.print(i);
-        Serial.print(F("] "));
         Serial.print(name);
-        Serial.print(F(" - "));
 
-        switch (OS.getTaskState(i)) {
-            case TaskState::Running: Serial.print(F("RUNNING")); break;
-            case TaskState::Paused:  Serial.print(F("PAUSED"));  break;
-            case TaskState::Stopped: Serial.print(F("STOPPED")); break;
-            case TaskState::Invalid: Serial.print(F("DELETED")); break;
+        // Pad name to 12 chars
+        size_t nameLen = strlen(name);
+        for (size_t j = nameLen; j < 12; j++) {
+            Serial.print(' ');
         }
 
-        Serial.print(F(" (runs: "));
-        Serial.print(OS.getTaskRunCount(i));
-        Serial.println(F(")"));
+        switch (OS.getTaskState(i)) {
+            case TaskState::Running: Serial.print(F("RUNNING  ")); break;
+            case TaskState::Paused:  Serial.print(F("PAUSED   ")); break;
+            case TaskState::Stopped: Serial.print(F("STOPPED  ")); break;
+            default:                 Serial.print(F("???      ")); break;
+        }
+
+        Serial.println(OS.getTaskRunCount(i));
     }
     Serial.println();
 }
@@ -141,23 +225,30 @@ void setup() {
     Serial.begin(115200);
     while (!Serial) { ; }
 
-    Serial.println(F("=== Arda Task Control Demo ===\n"));
+    Serial.println(F("=== Arda Task Control Demo ==="));
 
-    // Register tasks and check for errors
-    int8_t id1 = OS.createTask("fastBlink", fastBlink_setup, fastBlink_loop, 100);
-    int8_t id2 = OS.createTask("counter", counter_setup, counter_loop, 2000);
-    int8_t id3 = OS.createTask("cmdHandler", commandHandler_setup, commandHandler_loop, 0);
+    // Create tasks with teardown for blinker
+    int8_t blinkId = OS.createTask("blinker", blinker_setup, blinker_loop,
+                                    200, blinker_teardown);
+    int8_t heartId = OS.createTask("heart", heartbeat_setup, heartbeat_loop, 2000);
+    int8_t cmdId = OS.createTask("cmdr", commander_setup, commander_loop, 0);
 
-    if (id1 == -1 || id2 == -1 || id3 == -1) {
-        Serial.println(F("ERROR: Failed to create one or more tasks!"));
+    if (blinkId == -1 || heartId == -1 || cmdId == -1) {
+        Serial.print(F("ERROR: Task creation failed: "));
+        Serial.println(OS.errorString(OS.getError()));
         while (1) { ; }
     }
 
     int8_t started = OS.begin();
     if (started == -1) {
-        Serial.println(F("ERROR: OS.begin() failed!"));
+        Serial.print(F("ERROR: OS.begin() failed: "));
+        Serial.println(OS.errorString(OS.getError()));
         while (1) { ; }
     }
+
+    Serial.print(F("Started "));
+    Serial.print(started);
+    Serial.println(F(" tasks"));
 
     listTasks();
 }
