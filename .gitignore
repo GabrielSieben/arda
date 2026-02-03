@@ -1,0 +1,38 @@
+# Compiled binaries
+test/test_arda
+test/test_aros
+test/test_example
+test/test_example_compile
+test/test_case_insensitive
+test/test_custom_name_len
+test/test_no_global_instance
+test/test_no_priority
+test/test_no_names
+test/test_priority_example
+test/test_arda_cov
+*.o
+
+# Coverage files
+test/*.gcov
+test/*.gcda
+test/*.gcno
+*.a
+*.so
+*.dylib
+
+# Build directories
+build/
+cmake-build-*/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Arduino build artifacts
+*.elf
+*.hex
+*.bin
