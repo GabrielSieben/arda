@@ -14,8 +14,8 @@
 // Version info
 #define ARDA_VERSION_MAJOR 1
 #define ARDA_VERSION_MINOR 1
-#define ARDA_VERSION_PATCH 1
-#define ARDA_VERSION_STRING "1.1.1"
+#define ARDA_VERSION_PATCH 2
+#define ARDA_VERSION_STRING "1.1.2"
 
 // Configuration constants - adjust these to tune memory usage vs capability
 #ifndef ARDA_MAX_TASKS

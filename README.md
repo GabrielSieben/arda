@@ -40,6 +40,100 @@ void loop() {
 }
 ```
 
+## Cooperative Multitasking
+
+This is **cooperative** multitasking, not preemptive. Key implications:
+
+### You Must Call run() in loop()
+
+**If you forget to call `OS.run()` in your Arduino `loop()` function, no tasks will execute.** The scheduler only runs tasks when `run()` is called.
+
+```cpp
+void loop() {
+    OS.run();  // REQUIRED - tasks only execute when this is called
+    // Other non-task code can go here
+}
+```
+
+### Tasks Must Return Quickly
+
+Each task's `loop()` function must return promptly so other tasks get CPU time. If a task never returns, the entire scheduler hangs.
+
+**Bad:**
+```cpp
+TASK_LOOP(blocking) {
+    while (waiting_for_something) {
+        // Blocks forever - other tasks starve!
+    }
+}
+```
+
+**Good:**
+```cpp
+TASK_LOOP(nonblocking) {
+    if (!waiting_for_something) {
+        // Do work
+    }
+    // Returns immediately, will be called again next cycle
+}
+```
+
+### Long Operations Need State Machines
+
+Break long operations into steps:
+
+```cpp
+static int step = 0;
+TASK_LOOP(multistep) {
+    switch (step) {
+        case 0: doPartOne(); step++; break;
+        case 1: doPartTwo(); step++; break;
+        case 2: doPartThree(); step = 0; break;
+    }
+}
+```
+
+### Interrupt Safety (ISRs)
+
+**Arda is strictly single-threaded and not safe to call from interrupt service routines.**
+
+Calling any Arda method from an ISR can corrupt scheduler state because operations like `run()`, `startTask()`, and `stopTask()` perform multi-step state changes that are not atomic. An interrupt firing mid-operation will see inconsistent state.
+
+To communicate between ISRs and tasks:
+
+```cpp
+// Declare a volatile flag for ISR communication
+volatile bool dataReady = false;
+
+// In your ISR - only set the flag, don't call Arda
+ISR(TIMER1_COMPA_vect) {
+    dataReady = true;
+}
+
+// In your task - poll the flag
+TASK_LOOP(processor) {
+    if (dataReady) {
+        dataReady = false;
+        processData();
+    }
+}
+```
+
+Key points:
+- Use `volatile` for variables shared between ISRs and tasks
+- Keep ISRs minimal - set flags, buffer data, nothing else
+- Let tasks poll flags and do the actual work
+- Never call `OS.run()`, `OS.startTask()`, `OS.yield()`, etc. from an ISR
+
+## Task States
+
+| State | Description |
+|-------|-------------|
+| `TaskState::Stopped` | Task is not running (can be started or deleted) |
+| `TaskState::Running` | Task is active and executing on each scheduler cycle |
+| `TaskState::Paused` | Task is temporarily suspended (can be resumed) |
+| `TaskState::Invalid` | Returned by getTaskState() for invalid or deleted task IDs |
+
 ## API Reference
 
 ### Task Management
@@ -196,14 +290,304 @@ switch (result) {
 > **Warning: Iterator Invalidation**
 > Do not delete tasks while iterating with `getSlotCount()` or using an array from `getValidTaskIds()`. Deleting a task during iteration may cause you to skip tasks or access invalid slots. If you need to delete tasks based on some condition, collect the IDs first, then delete after the iteration completes.
 
-## Task States
+### Batch Operations
 
-| State | Description |
-|-------|-------------|
-| `TaskState::Stopped` | Task is not running (can be started or deleted) |
-| `TaskState::Running` | Task is active and executing on each scheduler cycle |
-| `TaskState::Paused` | Task is temporarily suspended (can be resumed) |
-| `TaskState::Invalid` | Returned by getTaskState() for invalid or deleted task IDs |
+Perform operations on multiple tasks at once:
+
+```cpp
+int8_t taskIds[] = {task1, task2, task3};
+
+// Start all tasks
+int8_t started = OS.startTasks(taskIds, 3);
+if (started < 3) {
+    // Some tasks failed to start - check getError() for first failure
+}
+
+// Pause all tasks
+int8_t paused = OS.pauseTasks(taskIds, 3);
+
+// Resume all tasks
+int8_t resumed = OS.resumeTasks(taskIds, 3);
+
+// Stop all tasks
+int8_t stopped = OS.stopTasks(taskIds, 3);
+```
+
+Batch operations:
+- Attempt all operations regardless of individual failures
+- Return the count of successful operations
+- Set error to the first failure encountered (if any) - first failures are typically more diagnostic
+
+> **Warning: Partial Failures**
+> Batch operations may partially succeed. Always compare the return value against the expected count. Use the optional `failedId` parameter to identify which task failed first:
+> ```cpp
+> int8_t failedTask;
+> int8_t started = OS.startTasks(taskIds, 3, &failedTask);
+> if (started < 3) {
+>     Serial.print("Task failed: "); Serial.println(failedTask);
+>     Serial.print("Error: "); Serial.println((int)OS.getError());
+> }
+> ```
+
+### Task Timeouts
+
+Arda can detect when tasks exceed their expected execution time:
+
+```cpp
+// Called when a task exceeds its timeout
+void onTimeout(int8_t taskId, uint32_t actualDurationMs) {
+    Serial.print(F("Task "));
+    Serial.print(OS.getTaskName(taskId));
+    Serial.print(F(" exceeded timeout: "));
+    Serial.print(actualDurationMs);
+    Serial.println(F("ms"));
+}
+
+void setup() {
+    OS.setTimeoutCallback(onTimeout);
+
+    int8_t id = OS.createTask("worker", worker_setup, worker_loop, 100);
+    OS.setTaskTimeout(id, 50);  // Warn if task takes > 50ms
+
+    OS.begin();
+}
+```
+
+**Important limitations:**
+- Timeouts are checked **after** the task returns - Arda cannot interrupt a blocking task
+- The callback is informational only; it cannot preempt or kill the task
+- Use this for debugging and monitoring, not for hard real-time guarantees
+- On cooperative systems, a truly blocking task will still hang the scheduler
+
+**Why can't timeouts interrupt blocking tasks?** Arda is a cooperative scheduler with no preemption mechanism. Timeouts are checked *after* each task's `loop()` returns—there's no way to interrupt a task mid-execution without hardware timer interrupts and setjmp/longjmp, which would add significant complexity and memory overhead. Think of task timeouts as "soft monitoring" for tasks that eventually return but took too long, not as a hard deadline enforcer.
+
+### Debug/Trace Callback
+
+Monitor task execution for debugging:
+
+```cpp
+void onTrace(int8_t taskId, TraceEvent event) {
+    const char* eventNames[] = {
+        "STARTING", "STARTED", "LOOP_BEGIN", "LOOP_END",
+        "STOPPING", "STOPPED", "PAUSED", "RESUMED", "DELETED"
+    };
+    Serial.print(OS.getTaskName(taskId));
+    Serial.print(F(": "));
+    Serial.println(eventNames[static_cast<uint8_t>(event)]);
+}
+
+void setup() {
+    OS.setTraceCallback(onTrace);
+    // ... create tasks ...
+    OS.begin();
+}
+```
+
+Trace events:
+- `TraceEvent::TaskStarting` - About to run setup() (fires before callback)
+- `TraceEvent::TaskStarted` - setup() completed, task is now Running
+- `TraceEvent::TaskLoopBegin` - About to run loop() (fires before callback)
+- `TraceEvent::TaskLoopEnd` - loop() completed
+- `TraceEvent::TaskStopping` - About to run teardown() (only emitted if teardown exists)
+- `TraceEvent::TaskStopped` - Task is now Stopped
+- `TraceEvent::TaskPaused` - Task state changed to Paused
+- `TraceEvent::TaskResumed` - Task state changed to Running
+- `TraceEvent::TaskDeleted` - Task was deleted (already invalidated; callback receives ID only)
+
+> **Note:** The "ing" variants (`TaskStarting`, `TaskStopping`, `TaskLoopBegin`) bracket user callbacks - they fire *before* your code runs. Pause/resume have no callbacks to bracket, so only "ed" variants exist.
+
+Set callback to `nullptr` to disable tracing (recommended for production).
+
+**Note:** When `ARDA_NO_NAMES` is defined, `getTaskName(taskId)` returns nullptr. Use the numeric task ID for identification in trace output instead.
+
+### Start Failure Callback
+
+To get detailed information when tasks fail to start during `begin()`:
+
+```cpp
+void onStartFailed(int8_t taskId, ArdaError error) {
+    Serial.print(F("Task "));
+    Serial.print(taskId);
+    Serial.print(F(" failed to start: "));
+    Serial.println(Arda::errorString(error));
+}
+
+void setup() {
+    OS.setStartFailureCallback(onStartFailed);
+    // ... create tasks ...
+    OS.begin();  // Callback called for each task that fails
+}
+```
+
+## Built-in Shell
+
+Arda includes a built-in serial shell task (at ID 0) for runtime task management. The shell is enabled by default and provides a command-line interface over Serial.
+
+### Shell Commands
+
+**Core commands (always available, even with `ARDA_SHELL_MINIMAL`):**
+
+| Command | Description |
+|---------|-------------|
+| `b <id>` | Begin task |
+| `s <id>` | Stop task |
+| `p <id>` | Pause task |
+| `r <id>` | Resume task |
+| `k <id>` | Kill task (stop + delete in one command) |
+| `d <id>` | Delete task (must be stopped first) |
+| `l` | List tasks (format: `ID STATE NAME`, e.g., `0 R sh`) |
+| `h` or `?` | Help (list commands) |
+
+**Extended commands (not available with `ARDA_SHELL_MINIMAL`):**
+
+| Command | Description |
+|---------|-------------|
+| `i <id>` | Task info (interval, runs, priority, timeout) |
+| `w <id>` | When: shows time since last run and next due (or `[P]`/`[S]` if paused/stopped) |
+| `a <id> <ms>` | Adjust interval (set new interval in milliseconds) |
+| `y <id> <pri>` | Set priority 0-4 (not available with `ARDA_NO_PRIORITY`) |
+| `n <id> <name>` | Rename task (not available with `ARDA_NO_NAMES`) |
+| `g <id>` | Go: begin task with immediate execution (like `startTask(id, true)`) |
+| `l` | List all tasks |
+| `e` | Last error code and message |
+| `c` | Clear error (resets `getError()` to `ArdaError::Ok`) |
+| `m` | Memory info (task count, max tasks, slots used) |
+| `u` | Uptime (seconds since begin()) |
+| `v` | Arda version |
+| `o 0\|1` | Set echo off/on (shows current state) |
+
+**State codes in `l` output:** `R` = Running, `P` = Paused, `S` = Stopped
+
+**Buffer size note:** Extended commands like `n <id> <name>` and `a <id> <ms>` need sufficient buffer space. The default `ARDA_SHELL_BUF_SIZE` of 16 is sufficient for most use cases, but increase it to 20+ if using long task names or very large interval values.
+
+### Shell Configuration
+
+```cpp
+// Disable shell entirely (saves ~600 bytes flash, ~50 bytes RAM)
+#define ARDA_NO_SHELL
+#include "Arda.h"
+```
+
+```cpp
+// Minimal shell - only core commands (p/r/s/t/d/l/h), saves ~200 bytes
+// Removes debug commands: i, u, m, e, v
+#define ARDA_SHELL_MINIMAL
+#include "Arda.h"
+```
+
+```cpp
+// Manual start - shell doesn't auto-start with begin()
+#define ARDA_SHELL_MANUAL_START
+#include "Arda.h"
+
+// Later, manually start/stop the shell:
+OS.startShell();
+OS.stopShell();
+```
+
+```cpp
+// Custom command buffer size (default: 16, min 8 recommended)
+// Increase if you need longer task names in output or programmatic commands
+#define ARDA_SHELL_BUF_SIZE 32
+#include "Arda.h"
+```
+
+### Shell API
+
+```cpp
+// Set a different Stream for shell I/O (default: Serial)
+// WARNING: Stream must remain valid for shell lifetime
+OS.setShellStream(Serial1);
+
+// Check if shell is running
+if (OS.isShellRunning()) { ... }
+
+// Execute shell commands programmatically
+OS.exec("p 1");     // Pause task 1
+OS.exec("l");       // List tasks (output goes to shellStream)
+OS.exec("i 2");     // Info about task 2
+
+// Get shell task ID (always 0 when shell enabled)
+int8_t shellId = OS.getShellTaskId();
+
+// Disable command echo (on by default)
+OS.setShellEcho(false);
+```
+
+**Command echo:** By default, the shell echoes received commands back with a `> ` prefix (useful since serial monitors often don't show what you typed). Disable with `OS.setShellEcho(false)`. Define `ARDA_NO_SHELL_ECHO` to remove echo support entirely.
+
+**`exec()` notes:**
+- Command must be shorter than `ARDA_SHELL_BUF_SIZE` (default 16)
+- Does not echo commands (echo is for serial input only)
+- Re-entrant safe: nested calls (e.g., from a callback triggered by a shell command) are silently ignored
+- Works even after shell task is deleted (uses class members, not the task)
+
+### Shell Behavior
+
+- **Reserved ID 0**: When shell is enabled, user tasks start at ID 1
+- **Self-referential**: Shell appears in its own `l` listing
+- **Self-controllable**: Shell can pause/stop itself (`p 0`, `s 0`) - user loses serial control until reboot. This is intentional: your code can still call `OS.exec()` or manipulate tasks directly, and stopping the shell frees CPU cycles.
+- **Self-destructible**: Use `k 0` to kill the shell (stop+delete), freeing task slot 0 for reuse. Or `s 0` then `OS.exec("d 0")` from another task. This is useful when you need the extra task slot and no longer need serial control. Note: `d` requires Stopped state; `s 0` stops the shell so it won't read follow-up commands.
+- **reset() restores shell**: Calling `reset()` removes all user tasks but reinitializes the shell task (in Stopped state) for the global `OS` instance
+- **Requires global OS**: Shell requires the global `OS` instance (incompatible with `ARDA_NO_GLOBAL_INSTANCE`)
+- **Global instance only**: Shell is only initialized on the global `OS`. Local `Arda` instances work normally without a shell task (their tasks start at ID 0)
+
+### Shell Resource Impact
+
+| Configuration | Flash (AVR) | RAM (AVR) |
+|--------------|-------------|-----------|
+| Full shell (default) | ~600 bytes | ~50 bytes |
+| `ARDA_SHELL_MINIMAL` | ~400 bytes | ~50 bytes |
+| `ARDA_NO_SHELL` | 0 | 0 |
+
+## Priority Scheduling
+
+By default, Arda supports 5-level task priority. Higher-priority tasks run before lower-priority tasks when both are ready in the same scheduling cycle.
+
+### TaskPriority Enum
+
+Use the `TaskPriority` enum:
+
+| Level | Value | Description |
+|-------|-------|-------------|
+| `TaskPriority::Lowest` | 0 | Background tasks |
+| `TaskPriority::Low` | 1 | Below normal priority |
+| `TaskPriority::Normal` | 2 | Default priority (assigned to all new tasks) |
+| `TaskPriority::High` | 3 | Above normal priority |
+| `TaskPriority::Highest` | 4 | Critical tasks |
+
+### Example Usage
+
+```cpp
+// Create tasks with explicit priority
+int8_t criticalId = OS.createTask("critical", setup, loop, 100, nullptr, true, TaskPriority::Highest);
+int8_t normalId = OS.createTask("normal", setup, loop, 100);  // Default (TaskPriority::Normal)
+int8_t bgId = OS.createTask("background", setup, loop, 100, nullptr, true, TaskPriority::Lowest);
+
+// Change priority at runtime
+OS.setTaskPriority(normalId, TaskPriority::High);
+
+// Query priority
+TaskPriority priority = OS.getTaskPriority(criticalId);  // Returns TaskPriority::Highest
+```
+
+### Priority Behavior
+
+- **Within a scheduling cycle**: Higher-priority ready tasks run first
+- **Interval-based**: Priority only matters when multiple tasks are ready at the same time
+- **Tie-breaking**: Tasks with equal priority run in snapshot order (typically creation order)
+- **Zero memory overhead**: Priority is packed into unused bits of the existing flags byte
+
+> **Warning: Starvation**
+> A high-priority task with `interval=0` (runs every cycle) will starve lower-priority tasks completely. Ensure high-priority tasks either have non-zero intervals or return quickly.
+
+### Disabling Priority
+
+If you don't need priority scheduling and want to save code size (especially on constrained devices like ATmega328), define `ARDA_NO_PRIORITY` before including Arda.h. This:
+
+- Removes the priority-scanning loop (simpler, faster scheduling)
+- Restores array-order execution (tasks run in creation/snapshot order)
+- Removes `TaskPriority` enum and priority API (`setTaskPriority`, `getTaskPriority`, priority overload of `createTask`)
 
 ## Error Codes
 
@@ -291,6 +675,44 @@ REGISTER_TASK_ID_ON(taskId, myScheduler, reporter, 1000);
 REGISTER_TASK_ON_WITH_TEARDOWN(myScheduler, worker, 100);
 ```
 
+## Timing Behavior
+
+### Interval Scheduling
+
+Tasks with intervals guarantee a minimum gap between executions. If a task with a 100ms interval runs at t=105, the next run will be at t=205 or later. `getTaskLastRun()` returns the actual execution time.
+
+### Catch-up Prevention
+
+If the scheduler falls behind (e.g., due to a long-running task), it does not run multiple catch-up iterations.
+
+**Example:** A task with 100ms interval last ran at t=100. If the next `run()` call happens at t=350, the task runs once and `lastRun` is set to t=350. The next execution will be at t=450 or later.
+
+**Implication:** If you need strict periodicity, implement your own timing logic using `millis()` inside the task.
+
+### millis() Overflow
+
+Arduino's `millis()` overflows after ~49 days. Arda handles this correctly - interval calculations and `uptime()` continue to work due to unsigned arithmetic properties.
+
+### Run Count Overflow
+
+`getTaskRunCount()` returns a `uint32_t` that increments on each `loop()` execution. **Note:** This counter resets to 0 on each `startTask()` call, so it tracks runs since the most recent start, not lifetime executions. At 1ms intervals, this overflows after ~49 days. If you need cumulative execution counts across restarts, maintain your own counter.
+
+### Callback Depth Limit
+
+Arda limits nested callback depth to `ARDA_MAX_CALLBACK_DEPTH` (default: 8) to prevent stack overflow. This applies when:
+- A task's `setup()` calls `startTask()` on another task
+- A task's `teardown()` calls `stopTask()` on another task
+- A task's `loop()` triggers other tasks via `yield()`
+
+If the limit is exceeded, `startTask()` fails with `ArdaError::CallbackDepth`, and `stopTask()` returns `StopResult::TeardownSkipped` with `ArdaError::CallbackDepth` (task is stopped but teardown was not run).
+
+**Tuning `ARDA_MAX_CALLBACK_DEPTH`:**
+- **Lower (4-6):** For memory-constrained boards (ATmega328) or tasks with large local variables
+- **Default (8):** Good balance for most applications
+- **Higher (10-16):** If you have complex task chains that legitimately need deep nesting
+
+Each level of nesting consumes stack space for the callback's local variables plus ~20-50 bytes of return address and saved registers.
+
 ## Configuration
 
 ### Compile-Time Constants
@@ -361,127 +783,6 @@ Arda scheduler2;  // Multiple independent schedulers
 #include "Arda.h"
 ```
 
-### Built-in Shell
-
-Arda includes a built-in serial shell task (at ID 0) for runtime task management. The shell is enabled by default and provides a command-line interface over Serial.
-
-#### Shell Commands
-
-**Core commands (always available, even with `ARDA_SHELL_MINIMAL`):**
-
-| Command | Description |
-|---------|-------------|
-| `b <id>` | Begin task |
-| `s <id>` | Stop task |
-| `p <id>` | Pause task |
-| `r <id>` | Resume task |
-| `k <id>` | Kill task (stop + delete in one command) |
-| `d <id>` | Delete task (must be stopped first) |
-| `l` | List tasks (format: `ID STATE NAME`, e.g., `0 R sh`) |
-| `h` or `?` | Help (list commands) |
-
-**Extended commands (not available with `ARDA_SHELL_MINIMAL`):**
-
-| Command | Description |
-|---------|-------------|
-| `i <id>` | Task info (interval, runs, priority, timeout) |
-| `w <id>` | When: shows time since last run and next due (or `[P]`/`[S]` if paused/stopped) |
-| `a <id> <ms>` | Adjust interval (set new interval in milliseconds) |
-| `y <id> <pri>` | Set priority 0-4 (not available with `ARDA_NO_PRIORITY`) |
-| `n <id> <name>` | Rename task (not available with `ARDA_NO_NAMES`) |
-| `g <id>` | Go: begin task with immediate execution (like `startTask(id, true)`) |
-| `l` | List all tasks |
-| `e` | Last error code and message |
-| `c` | Clear error (resets `getError()` to `ArdaError::Ok`) |
-| `m` | Memory info (task count, max tasks, slots used) |
-| `u` | Uptime (seconds since begin()) |
-| `v` | Arda version |
-| `o 0\|1` | Set echo off/on (shows current state) |
-
-**State codes in `l` output:** `R` = Running, `P` = Paused, `S` = Stopped
-
-**Buffer size note:** Extended commands like `n <id> <name>` and `a <id> <ms>` need sufficient buffer space. The default `ARDA_SHELL_BUF_SIZE` of 16 is sufficient for most use cases, but increase it to 20+ if using long task names or very large interval values.
-
-#### Shell Configuration
-
-```cpp
-// Disable shell entirely (saves ~600 bytes flash, ~50 bytes RAM)
-#define ARDA_NO_SHELL
-#include "Arda.h"
-```
-
-```cpp
-// Minimal shell - only core commands (p/r/s/t/d/l/h), saves ~200 bytes
-// Removes debug commands: i, u, m, e, v
-#define ARDA_SHELL_MINIMAL
-#include "Arda.h"
-```
-
-```cpp
-// Manual start - shell doesn't auto-start with begin()
-#define ARDA_SHELL_MANUAL_START
-#include "Arda.h"
-
-// Later, manually start/stop the shell:
-OS.startShell();
-OS.stopShell();
-```
-
-```cpp
-// Custom command buffer size (default: 16, min 8 recommended)
-// Increase if you need longer task names in output or programmatic commands
-#define ARDA_SHELL_BUF_SIZE 32
-#include "Arda.h"
-```
-
-#### Shell API
-
-```cpp
-// Set a different Stream for shell I/O (default: Serial)
-// WARNING: Stream must remain valid for shell lifetime
-OS.setShellStream(Serial1);
-
-// Check if shell is running
-if (OS.isShellRunning()) { ... }
-
-// Execute shell commands programmatically
-OS.exec("p 1");     // Pause task 1
-OS.exec("l");       // List tasks (output goes to shellStream)
-OS.exec("i 2");     // Info about task 2
-
-// Get shell task ID (always 0 when shell enabled)
-int8_t shellId = OS.getShellTaskId();
-
-// Disable command echo (on by default)
-OS.setShellEcho(false);
-```
-
-**Command echo:** By default, the shell echoes received commands back with a `> ` prefix (useful since serial monitors often don't show what you typed). Disable with `OS.setShellEcho(false)`. Define `ARDA_NO_SHELL_ECHO` to remove echo support entirely.
-
-**`exec()` notes:**
-- Command must be shorter than `ARDA_SHELL_BUF_SIZE` (default 16)
-- Does not echo commands (echo is for serial input only)
-- Re-entrant safe: nested calls (e.g., from a callback triggered by a shell command) are silently ignored
-- Works even after shell task is deleted (uses class members, not the task)
-
-#### Shell Behavior
-
-- **Reserved ID 0**: When shell is enabled, user tasks start at ID 1
-- **Self-referential**: Shell appears in its own `l` listing
-- **Self-controllable**: Shell can pause/stop itself (`p 0`, `s 0`) - user loses serial control until reboot. This is intentional: your code can still call `OS.exec()` or manipulate tasks directly, and stopping the shell frees CPU cycles.
-- **Self-destructible**: Use `k 0` to kill the shell (stop+delete), freeing task slot 0 for reuse. Or `s 0` then `OS.exec("d 0")` from another task. This is useful when you need the extra task slot and no longer need serial control. Note: `d` requires Stopped state; `s 0` stops the shell so it won't read follow-up commands.
-- **reset() restores shell**: Calling `reset()` removes all user tasks but reinitializes the shell task (in Stopped state) for the global `OS` instance
-- **Requires global OS**: Shell requires the global `OS` instance (incompatible with `ARDA_NO_GLOBAL_INSTANCE`)
-- **Global instance only**: Shell is only initialized on the global `OS`. Local `Arda` instances work normally without a shell task (their tasks start at ID 0)
-
-#### Resource Impact
-
-| Configuration | Flash (AVR) | RAM (AVR) |
-|--------------|-------------|-----------|
-| Full shell (default) | ~600 bytes | ~50 bytes |
-| `ARDA_SHELL_MINIMAL` | ~400 bytes | ~50 bytes |
-| `ARDA_NO_SHELL` | 0 | 0 |
-
 ### Combining Configuration Options
 
 For maximum memory savings on extremely constrained devices (e.g., ATtiny), combine multiple options:
@@ -501,363 +802,6 @@ This configuration saves:
 - ~600 bytes flash + ~50 bytes RAM from disabling shell
 - ~200 bytes flash from short error strings
 - Reduced task array size from fewer max tasks
-
-## Hardware Watchdog (AVR)
-
-On AVR platforms (Uno, Mega, Nano, Pro Mini, etc.), Arda can optionally enable the hardware watchdog timer with an 8-second timeout. If any task blocks for more than 8 seconds without returning, the MCU resets automatically, recovering the system.
-
-### Enabling the Watchdog
-
-```cpp
-#define ARDA_WATCHDOG
-#include "Arda.h"
-```
-
-### How It Works
-
-- Watchdog is enabled when `begin()` is called
-- Timer is reset at the start of each `run()` cycle (so an idle scheduler with no runnable tasks won't trigger a reset)
-- Timer is also reset before each task's `loop()` executes and during `yield()` calls
-- If a task blocks (infinite loop, deadlock, etc.) for >8 seconds, the watchdog expires and resets the MCU
-- After reset, `setup()` runs again and the scheduler restarts cleanly
-
-### Best Practices
-
-For long operations, break them into chunks that return quickly, allowing the scheduler to feed the watchdog between task executions:
-
-```cpp
-// State machine approach (recommended, no ARDA_YIELD needed):
-static int workIndex = 0;
-void longTask_loop() {
-    for (int i = 0; i < 100; i++) {
-        doWork(workIndex++);
-    }
-    if (workIndex >= 10000) workIndex = 0;
-    // Returns quickly - watchdog fed between run() cycles
-}
-```
-
-If refactoring is not possible and you must use `yield()` (see [Appendix: yield()](#appendix-yield)):
-
-```cpp
-#define ARDA_YIELD
-#include "Arda.h"
-
-void longTask_loop() {
-    for (int i = 0; i < 10000; i++) {
-        doWork();
-        if (i % 100 == 0) OS.yield();  // Feed watchdog, let other tasks run
-    }
-}
-```
-
-### Platform Support
-
-| Platform | Watchdog Status |
-|----------|-----------------|
-| AVR (Uno, Mega, Nano, etc.) | Opt-in, 8s timeout |
-| ESP8266, ESP32, SAMD, RP2040 | Not supported |
-
-## Priority Scheduling
-
-By default, Arda supports 5-level task priority. Higher-priority tasks run before lower-priority tasks when both are ready in the same scheduling cycle.
-
-### TaskPriority Enum
-
-Use the `TaskPriority` enum:
-
-| Level | Value | Description |
-|-------|-------|-------------|
-| `TaskPriority::Lowest` | 0 | Background tasks |
-| `TaskPriority::Low` | 1 | Below normal priority |
-| `TaskPriority::Normal` | 2 | Default priority (assigned to all new tasks) |
-| `TaskPriority::High` | 3 | Above normal priority |
-| `TaskPriority::Highest` | 4 | Critical tasks |
-
-### Example Usage
-
-```cpp
-// Create tasks with explicit priority
-int8_t criticalId = OS.createTask("critical", setup, loop, 100, nullptr, true, TaskPriority::Highest);
-int8_t normalId = OS.createTask("normal", setup, loop, 100);  // Default (TaskPriority::Normal)
-int8_t bgId = OS.createTask("background", setup, loop, 100, nullptr, true, TaskPriority::Lowest);
-
-// Change priority at runtime
-OS.setTaskPriority(normalId, TaskPriority::High);
-
-// Query priority
-TaskPriority priority = OS.getTaskPriority(criticalId);  // Returns TaskPriority::Highest
-```
-
-### Priority Behavior
-
-- **Within a scheduling cycle**: Higher-priority ready tasks run first
-- **Interval-based**: Priority only matters when multiple tasks are ready at the same time
-- **Tie-breaking**: Tasks with equal priority run in snapshot order (typically creation order)
-- **Zero memory overhead**: Priority is packed into unused bits of the existing flags byte
-
-> **Warning: Starvation**
-> A high-priority task with `interval=0` (runs every cycle) will starve lower-priority tasks completely. Ensure high-priority tasks either have non-zero intervals or return quickly.
-
-### Disabling Priority
-
-If you don't need priority scheduling and want to save code size (especially on constrained devices like ATmega328), define `ARDA_NO_PRIORITY` before including Arda.h. This:
-
-- Removes the priority-scanning loop (simpler, faster scheduling)
-- Restores array-order execution (tasks run in creation/snapshot order)
-- Removes `TaskPriority` enum and priority API (`setTaskPriority`, `getTaskPriority`, priority overload of `createTask`)
-
-## Cooperative Multitasking
-
-This is **cooperative** multitasking, not preemptive. Key implications:
-
-### You Must Call run() in loop()
-
-**If you forget to call `OS.run()` in your Arduino `loop()` function, no tasks will execute.** The scheduler only runs tasks when `run()` is called.
-
-```cpp
-void loop() {
-    OS.run();  // REQUIRED - tasks only execute when this is called
-    // Other non-task code can go here
-}
-```
-
-### Tasks Must Return Quickly
-
-Each task's `loop()` function must return promptly so other tasks get CPU time. If a task never returns, the entire scheduler hangs.
-
-**Bad:**
-```cpp
-TASK_LOOP(blocking) {
-    while (waiting_for_something) {
-        // Blocks forever - other tasks starve!
-    }
-}
-```
-
-**Good:**
-```cpp
-TASK_LOOP(nonblocking) {
-    if (!waiting_for_something) {
-        // Do work
-    }
-    // Returns immediately, will be called again next cycle
-}
-```
-
-### Long Operations Need State Machines
-
-Break long operations into steps:
-
-```cpp
-static int step = 0;
-TASK_LOOP(multistep) {
-    switch (step) {
-        case 0: doPartOne(); step++; break;
-        case 1: doPartTwo(); step++; break;
-        case 2: doPartThree(); step = 0; break;
-    }
-}
-```
-
-## Timing Behavior
-
-### Interval Scheduling
-
-Tasks with intervals guarantee a minimum gap between executions. If a task with a 100ms interval runs at t=105, the next run will be at t=205 or later. `getTaskLastRun()` returns the actual execution time.
-
-### Catch-up Prevention
-
-If the scheduler falls behind (e.g., due to a long-running task), it does not run multiple catch-up iterations.
-
-**Example:** A task with 100ms interval last ran at t=100. If the next `run()` call happens at t=350, the task runs once and `lastRun` is set to t=350. The next execution will be at t=450 or later.
-
-**Implication:** If you need strict periodicity, implement your own timing logic using `millis()` inside the task.
-
-### millis() Overflow
-
-Arduino's `millis()` overflows after ~49 days. Arda handles this correctly - interval calculations and `uptime()` continue to work due to unsigned arithmetic properties.
-
-### Run Count Overflow
-
-`getTaskRunCount()` returns a `uint32_t` that increments on each `loop()` execution. **Note:** This counter resets to 0 on each `startTask()` call, so it tracks runs since the most recent start, not lifetime executions. At 1ms intervals, this overflows after ~49 days. If you need cumulative execution counts across restarts, maintain your own counter.
-
-### Callback Depth Limit
-
-Arda limits nested callback depth to `ARDA_MAX_CALLBACK_DEPTH` (default: 8) to prevent stack overflow. This applies when:
-- A task's `setup()` calls `startTask()` on another task
-- A task's `teardown()` calls `stopTask()` on another task
-- A task's `loop()` triggers other tasks via `yield()`
-
-If the limit is exceeded, `startTask()` fails with `ArdaError::CallbackDepth`, and `stopTask()` returns `StopResult::TeardownSkipped` with `ArdaError::CallbackDepth` (task is stopped but teardown was not run).
-
-**Tuning `ARDA_MAX_CALLBACK_DEPTH`:**
-- **Lower (4-6):** For memory-constrained boards (ATmega328) or tasks with large local variables
-- **Default (8):** Good balance for most applications
-- **Higher (10-16):** If you have complex task chains that legitimately need deep nesting
-
-Each level of nesting consumes stack space for the callback's local variables plus ~20-50 bytes of return address and saved registers.
-
-### Task Timeouts
-
-Arda can detect when tasks exceed their expected execution time:
-
-```cpp
-// Called when a task exceeds its timeout
-void onTimeout(int8_t taskId, uint32_t actualDurationMs) {
-    Serial.print(F("Task "));
-    Serial.print(OS.getTaskName(taskId));
-    Serial.print(F(" exceeded timeout: "));
-    Serial.print(actualDurationMs);
-    Serial.println(F("ms"));
-}
-
-void setup() {
-    OS.setTimeoutCallback(onTimeout);
-
-    int8_t id = OS.createTask("worker", worker_setup, worker_loop, 100);
-    OS.setTaskTimeout(id, 50);  // Warn if task takes > 50ms
-
-    OS.begin();
-}
-```
-
-**Important limitations:**
-- Timeouts are checked **after** the task returns - Arda cannot interrupt a blocking task
-- The callback is informational only; it cannot preempt or kill the task
-- Use this for debugging and monitoring, not for hard real-time guarantees
-- On cooperative systems, a truly blocking task will still hang the scheduler
-
-**Why can't timeouts interrupt blocking tasks?** Arda is a cooperative scheduler with no preemption mechanism. Timeouts are checked *after* each task's `loop()` returns—there's no way to interrupt a task mid-execution without hardware timer interrupts and setjmp/longjmp, which would add significant complexity and memory overhead. Think of task timeouts as "soft monitoring" for tasks that eventually return but took too long, not as a hard deadline enforcer.
-
-### Batch Operations
-
-Perform operations on multiple tasks at once:
-
-```cpp
-int8_t taskIds[] = {task1, task2, task3};
-
-// Start all tasks
-int8_t started = OS.startTasks(taskIds, 3);
-if (started < 3) {
-    // Some tasks failed to start - check getError() for first failure
-}
-
-// Pause all tasks
-int8_t paused = OS.pauseTasks(taskIds, 3);
-
-// Resume all tasks
-int8_t resumed = OS.resumeTasks(taskIds, 3);
-
-// Stop all tasks
-int8_t stopped = OS.stopTasks(taskIds, 3);
-```
-
-Batch operations:
-- Attempt all operations regardless of individual failures
-- Return the count of successful operations
-- Set error to the first failure encountered (if any) - first failures are typically more diagnostic
-
-> **Warning: Partial Failures**
-> Batch operations may partially succeed. Always compare the return value against the expected count. Use the optional `failedId` parameter to identify which task failed first:
-> ```cpp
-> int8_t failedTask;
-> int8_t started = OS.startTasks(taskIds, 3, &failedTask);
-> if (started < 3) {
->     Serial.print("Task failed: "); Serial.println(failedTask);
->     Serial.print("Error: "); Serial.println((int)OS.getError());
-> }
-> ```
-
-### Debug/Trace Callback
-
-Monitor task execution for debugging:
-
-```cpp
-void onTrace(int8_t taskId, TraceEvent event) {
-    const char* eventNames[] = {
-        "STARTING", "STARTED", "LOOP_BEGIN", "LOOP_END",
-        "STOPPING", "STOPPED", "PAUSED", "RESUMED", "DELETED"
-    };
-    Serial.print(OS.getTaskName(taskId));
-    Serial.print(F(": "));
-    Serial.println(eventNames[static_cast<uint8_t>(event)]);
-}
-
-void setup() {
-    OS.setTraceCallback(onTrace);
-    // ... create tasks ...
-    OS.begin();
-}
-```
-
-Trace events:
-- `TraceEvent::TaskStarting` - About to run setup() (fires before callback)
-- `TraceEvent::TaskStarted` - setup() completed, task is now Running
-- `TraceEvent::TaskLoopBegin` - About to run loop() (fires before callback)
-- `TraceEvent::TaskLoopEnd` - loop() completed
-- `TraceEvent::TaskStopping` - About to run teardown() (only emitted if teardown exists)
-- `TraceEvent::TaskStopped` - Task is now Stopped
-- `TraceEvent::TaskPaused` - Task state changed to Paused
-- `TraceEvent::TaskResumed` - Task state changed to Running
-- `TraceEvent::TaskDeleted` - Task was deleted (already invalidated; callback receives ID only)
-
-> **Note:** The "ing" variants (`TaskStarting`, `TaskStopping`, `TaskLoopBegin`) bracket user callbacks - they fire *before* your code runs. Pause/resume have no callbacks to bracket, so only "ed" variants exist.
-
-Set callback to `nullptr` to disable tracing (recommended for production).
-
-**Note:** When `ARDA_NO_NAMES` is defined, `getTaskName(taskId)` returns nullptr. Use the numeric task ID for identification in trace output instead.
-
-### Start Failure Callback
-
-To get detailed information when tasks fail to start during `begin()`:
-
-```cpp
-void onStartFailed(int8_t taskId, ArdaError error) {
-    Serial.print(F("Task "));
-    Serial.print(taskId);
-    Serial.print(F(" failed to start: "));
-    Serial.println(Arda::errorString(error));
-}
-
-void setup() {
-    OS.setStartFailureCallback(onStartFailed);
-    // ... create tasks ...
-    OS.begin();  // Callback called for each task that fails
-}
-```
-
-### Interrupt Safety (ISRs)
-
-**Arda is strictly single-threaded and not safe to call from interrupt service routines.**
-
-Calling any Arda method from an ISR can corrupt scheduler state because operations like `run()`, `startTask()`, and `stopTask()` perform multi-step state changes that are not atomic. An interrupt firing mid-operation will see inconsistent state.
-
-To communicate between ISRs and tasks:
-
-```cpp
-// Declare a volatile flag for ISR communication
-volatile bool dataReady = false;
-
-// In your ISR - only set the flag, don't call Arda
-ISR(TIMER1_COMPA_vect) {
-    dataReady = true;
-}
-
-// In your task - poll the flag
-TASK_LOOP(processor) {
-    if (dataReady) {
-        dataReady = false;
-        processData();
-    }
-}
-```
-
-Key points:
-- Use `volatile` for variables shared between ISRs and tasks
-- Keep ISRs minimal - set flags, buffer data, nothing else
-- Let tasks poll flags and do the actual work
-- Never call `OS.run()`, `OS.startTask()`, `OS.yield()`, etc. from an ISR
 
 ## Memory
 
@@ -1027,6 +971,62 @@ TASK_LOOP(badTask) {
 ### yield() in setup/teardown
 
 Calling `yield()` from `setup()` or `teardown()` callbacks is supported but may produce surprising behavior—other tasks will execute in the middle of your task's initialization or cleanup. Generally avoid this unless you have a specific reason.
+
+## Appendix: Hardware Watchdog (AVR)
+
+On AVR platforms (Uno, Mega, Nano, Pro Mini, etc.), Arda can optionally enable the hardware watchdog timer with an 8-second timeout. If any task blocks for more than 8 seconds without returning, the MCU resets automatically, recovering the system.
+
+### Enabling the Watchdog
+
+```cpp
+#define ARDA_WATCHDOG
+#include "Arda.h"
+```
+
+### How It Works
+
+- Watchdog is enabled when `begin()` is called
+- Timer is reset at the start of each `run()` cycle (so an idle scheduler with no runnable tasks won't trigger a reset)
+- Timer is also reset before each task's `loop()` executes and during `yield()` calls
+- If a task blocks (infinite loop, deadlock, etc.) for >8 seconds, the watchdog expires and resets the MCU
+- After reset, `setup()` runs again and the scheduler restarts cleanly
+
+### Best Practices
+
+For long operations, break them into chunks that return quickly, allowing the scheduler to feed the watchdog between task executions:
+
+```cpp
+// State machine approach (recommended, no ARDA_YIELD needed):
+static int workIndex = 0;
+void longTask_loop() {
+    for (int i = 0; i < 100; i++) {
+        doWork(workIndex++);
+    }
+    if (workIndex >= 10000) workIndex = 0;
+    // Returns quickly - watchdog fed between run() cycles
+}
+```
+
+If refactoring is not possible and you must use `yield()` (see [Appendix: yield()](#appendix-yield)):
+
+```cpp
+#define ARDA_YIELD
+#include "Arda.h"
+
+void longTask_loop() {
+    for (int i = 0; i < 10000; i++) {
+        doWork();
+        if (i % 100 == 0) OS.yield();  // Feed watchdog, let other tasks run
+    }
+}
+```
+
+### Platform Support
+
+| Platform | Watchdog Status |
+|----------|-----------------|
+| AVR (Uno, Mega, Nano, etc.) | Opt-in, 8s timeout |
+| ESP8266, ESP32, SAMD, RP2040 | Not supported |
 
 ## License
 
