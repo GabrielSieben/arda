@@ -10,8 +10,9 @@
 uint32_t _mockMillis = 0;
 MockSerial Serial;
 
-// Enable case-insensitive names BEFORE including Arda
+// Enable case-insensitive names and disable shell BEFORE including Arda
 #define ARDA_CASE_INSENSITIVE_NAMES
+#define ARDA_NO_SHELL
 #include "../Arda.h"
 #include "../Arda.cpp"
 
@@ -55,9 +56,10 @@ void test_case_insensitive_duplicate_rejection() {
     assert(id3 == -1);
     assert(os.getError() == ArdaError::DuplicateName);
 
-    // Should accept different name
+    // Should accept different name and clear error
     int8_t id4 = os.createTask("TaskTwo", dummy_setup, dummy_loop, 0);
     assert(id4 >= 0);
+    assert(os.getError() == ArdaError::Ok);
 
     printf("PASSED\n");
 }
@@ -73,8 +75,9 @@ void test_case_insensitive_rename() {
     assert(os.renameTask(id1, "SECOND") == false);
     assert(os.getError() == ArdaError::DuplicateName);
 
-    // Should allow rename to case-variant of own name
+    // Should allow rename to case-variant of own name and clear error
     assert(os.renameTask(id1, "FIRST") == true);
+    assert(os.getError() == ArdaError::Ok);
     assert(strncmp(os.getTaskName(id1), "FIRST", ARDA_MAX_NAME_LEN) == 0);
 
     (void)id2;

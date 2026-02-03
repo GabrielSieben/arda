@@ -16,8 +16,9 @@
 uint32_t _mockMillis = 0;
 MockSerial Serial;
 
-// Disable names BEFORE including Arda
+// Disable names and shell BEFORE including Arda
 #define ARDA_NO_NAMES
+#define ARDA_NO_SHELL
 #include "../Arda.h"
 #include "../Arda.cpp"
 
@@ -220,10 +221,10 @@ void test_delete_and_reuse_slots() {
 }
 
 void test_error_string_includes_not_supported() {
-    printf("Test: errorString includes NOT_SUPPORTED... ");
+    printf("Test: errorString includes NotSupported... ");
 
     const char* str = Arda::errorString(ArdaError::NotSupported);
-    assert(strcmp(str, "NOT_SUPPORTED") == 0);
+    assert(strncmp(str, "Not supported", 32) == 0);
 
     printf("PASSED\n");
 }
@@ -248,17 +249,24 @@ void test_priority_does_not_conflict_with_deleted() {
 
     Arda os;
 
-    // Test all 16 priority levels (0-15) to ensure none are mistaken for deleted
-    // This was a bug when using bit 4 for deleted marker (conflicted with odd priorities)
-    for (uint8_t priority = 0; priority <= 15; priority++) {
+    // Test all 5 priority levels to ensure none are mistaken for deleted
+    TaskPriority priorities[] = {
+        TaskPriority::Lowest,
+        TaskPriority::Low,
+        TaskPriority::Normal,
+        TaskPriority::High,
+        TaskPriority::Highest
+    };
+
+    for (int i = 0; i < 5; i++) {
         int8_t id = os.createTask(task0_setup, task0_loop, 0);
         assert(id >= 0);
 
-        os.setTaskPriority(id, priority);
+        os.setTaskPriority(id, priorities[i]);
 
         // Task should still be valid (not mistakenly marked as deleted)
         assert(os.isValidTask(id) == true);
-        assert(os.getTaskPriority(id) == priority);
+        assert(os.getTaskPriority(id) == priorities[i]);
 
         // Clean up for next iteration
         os.deleteTask(id);

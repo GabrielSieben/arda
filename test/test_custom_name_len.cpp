@@ -10,8 +10,9 @@
 uint32_t _mockMillis = 0;
 MockSerial Serial;
 
-// Set custom name length BEFORE including Arda
+// Set custom name length and disable shell BEFORE including Arda
 #define ARDA_MAX_NAME_LEN 8  // Only 7 usable chars + null terminator
+#define ARDA_NO_SHELL
 #include "../Arda.h"
 #include "../Arda.cpp"
 

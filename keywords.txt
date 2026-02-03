@@ -35,7 +35,6 @@ setTimeoutCallback	KEYWORD2
 setStartFailureCallback	KEYWORD2
 setTraceCallback	KEYWORD2
 getTaskCount	KEYWORD2
-getActiveTaskCount	KEYWORD2
 getMaxTasks	KEYWORD2
 getTaskName	KEYWORD2
 getTaskState	KEYWORD2

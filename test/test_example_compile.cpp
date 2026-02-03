@@ -6,6 +6,8 @@
 uint32_t _mockMillis = 0;  // 32-bit to simulate Arduino's millis() overflow
 MockSerial Serial;
 
+// Disable shell for example compile test
+#define ARDA_NO_SHELL
 #include "../Arda.h"
 #include "../Arda.cpp"
 

@@ -13,16 +13,16 @@
 
 // Version info
 #define ARDA_VERSION_MAJOR 1
-#define ARDA_VERSION_MINOR 0
+#define ARDA_VERSION_MINOR 1
 #define ARDA_VERSION_PATCH 0
-#define ARDA_VERSION_STRING "1.0.0"
+#define ARDA_VERSION_STRING "1.1.0"
 
 // Configuration constants - adjust these to tune memory usage vs capability
 #ifndef ARDA_MAX_TASKS
 #define ARDA_MAX_TASKS 16          // Maximum concurrent tasks (1-127). Each task uses ~46-64 bytes depending on platform.
 #endif
 #ifndef ARDA_MAX_NAME_LEN
-#define ARDA_MAX_NAME_LEN 8        // Task name buffer size. Max usable chars = 7 (for null terminator).
+#define ARDA_MAX_NAME_LEN 16       // Task name buffer size. Max usable chars = 15 (for null terminator).
 #endif
 #ifndef ARDA_MAX_CALLBACK_DEPTH
 // Default 8: balances safety vs flexibility. Each nesting level uses ~20-50 bytes
@@ -31,12 +31,35 @@
 // Reduce to 4-6 for memory-constrained boards or callbacks with large locals.
 #define ARDA_MAX_CALLBACK_DEPTH 8
 #endif
+#if ARDA_MAX_CALLBACK_DEPTH < 1
+#error "ARDA_MAX_CALLBACK_DEPTH must be at least 1"
+#endif
 
 // Optional features - define before including Arda.h to enable
 // #define ARDA_CASE_INSENSITIVE_NAMES  // Make findTaskByName case-insensitive
 // #define ARDA_NO_GLOBAL_INSTANCE      // Don't create global 'OS' instance (create your own)
 // #define ARDA_NO_PRIORITY             // Disable priority scheduling (saves code size, uses array-order execution)
 // #define ARDA_NO_NAMES                // Disable task names (saves ARDA_MAX_NAME_LEN bytes per task)
+// #define ARDA_NO_SHELL                // Disable built-in shell task entirely
+// #define ARDA_SHELL_MANUAL_START      // Don't auto-start shell in begin()
+// #define ARDA_SHELL_MINIMAL           // Only core commands (p/r/s/t/d/l/h)
+// #define ARDA_NO_WATCHDOG             // Disable hardware watchdog (AVR only, auto-enabled by default)
+// #define ARDA_YIELD                   // Enable yield() - USE WITH CAUTION (see README)
+
+// Shell is only active when enabled AND global instance exists
+#if !defined(ARDA_NO_SHELL) && !defined(ARDA_NO_GLOBAL_INSTANCE)
+#define ARDA_SHELL_ACTIVE 1
+#define ARDA_SHELL_TASK_ID 0
+#ifndef ARDA_SHELL_BUF_SIZE
+#define ARDA_SHELL_BUF_SIZE 16    // Command buffer size (min 8 recommended)
+#endif
+#endif
+
+// Hardware watchdog (AVR only) - opt-in, resets MCU if any task blocks >8 seconds
+// Enable with: #define ARDA_WATCHDOG before including Arda.h
+#if defined(__AVR__) && defined(ARDA_WATCHDOG)
+#include <avr/wdt.h>
+#endif
 
 typedef void (*TaskCallback)(void);
 
@@ -62,12 +85,22 @@ enum class ArdaError : uint8_t {
     InvalidId,           // Task ID is out of range or deleted
     WrongState,          // Task is in wrong state for operation
     TaskExecuting,       // Cannot delete currently executing task
+#ifdef ARDA_YIELD
     TaskYielded,         // Cannot delete task that has yielded
+#endif
     AlreadyBegun,        // begin() was already called
     CallbackDepth,       // Maximum callback nesting depth exceeded
     StateChanged,        // Callback modified task state unexpectedly
     InCallback,          // Cannot call reset() from within a callback
-    NotSupported         // Feature disabled at compile time (e.g., names when ARDA_NO_NAMES)
+    NotSupported,        // Feature disabled at compile time (e.g., names when ARDA_NO_NAMES)
+    InvalidValue         // Parameter value out of valid range (e.g., priority > Highest)
+};
+
+// Result codes for startTask() - disambiguates success from partial success
+enum class StartResult : uint8_t {
+    Success,              // Task started, setup ran (if defined), task is Running
+    SetupChangedState,    // Setup ran but modified task state (e.g., stopped itself) - check getError()
+    Failed                // Task couldn't be started - check getError() for reason
 };
 
 // Result codes for stopTask() - disambiguates success from partial success
@@ -82,39 +115,43 @@ enum class StopResult : uint8_t {
 typedef void (*TimeoutCallback)(int8_t taskId, uint32_t actualDurationMs);
 typedef void (*StartFailureCallback)(int8_t taskId, ArdaError error);
 
-// Debug/trace events for monitoring task lifecycle (9 events)
+// Debug/trace events for monitoring task lifecycle (9 events).
+// Note: "ing" variants (TaskStarting, TaskStopping) bracket user callbacks (setup/teardown).
+// Pause/resume have no callbacks, so only "ed" variants exist - no code runs between states.
 enum class TraceEvent : uint8_t {
-    TaskStarting,   // Task setup() about to run
-    TaskStarted,    // Task setup() completed, now Running
-    TaskLoopBegin,  // Task loop() about to run
-    TaskLoopEnd,    // Task loop() completed
-    TaskStopping,   // Task teardown() about to run
-    TaskStopped,    // Task is now Stopped
-    TaskPaused,     // Task was paused
-    TaskResumed,    // Task was resumed
-    TaskDeleted     // Task was deleted
+    TaskStarting,   // About to run setup() - fires before callback
+    TaskStarted,    // setup() completed, task is now Running
+    TaskLoopBegin,  // About to run loop() - fires before callback
+    TaskLoopEnd,    // loop() completed
+    TaskStopping,   // About to run teardown() - fires before callback (only if teardown exists)
+    TaskStopped,    // Task is now Stopped (teardown completed or skipped)
+    TaskPaused,     // Task state changed to Paused (no callback, so no "TaskPausing")
+    TaskResumed,    // Task state changed to Running (no callback, so no "TaskResuming")
+    TaskDeleted     // Task was deleted (already invalidated, ID only)
 };
 typedef void (*TraceCallback)(int8_t taskId, TraceEvent event);
 
 #ifndef ARDA_NO_PRIORITY
-// Named priority levels for readability (can also use raw 0-15 values)
+// Named priority levels (5 levels, higher = runs first)
 enum class TaskPriority : uint8_t {
     Lowest  = 0,
-    Low     = 4,
-    Normal  = 8,   // Default
-    High    = 12,
-    Highest = 15
+    Low     = 1,
+    Normal  = 2,   // Default
+    High    = 3,
+    Highest = 4
 };
 #endif
 
 // Task flags bit positions (packed into single byte for RAM efficiency)
 #define ARDA_TASK_STATE_MASK   0x03  // bits 0-1: TaskState (0=Stopped, 1=Running, 2=Paused)
 #define ARDA_TASK_RAN_BIT      0x04  // bit 2: ranThisCycle
+#ifdef ARDA_YIELD
 #define ARDA_TASK_YIELD_BIT    0x08  // bit 3: inYield
+#endif
 #ifndef ARDA_NO_PRIORITY
-#define ARDA_TASK_PRIORITY_MASK  0xF0  // bits 4-7: priority (0-15, higher = runs first)
+#define ARDA_TASK_PRIORITY_MASK  0x70  // bits 4-6: priority (0-4, 3 bits). Bit 7 reserved.
 #define ARDA_TASK_PRIORITY_SHIFT 4
-#define ARDA_DEFAULT_PRIORITY    8     // Middle priority (TaskPriority::Normal)
+#define ARDA_DEFAULT_PRIORITY    2     // TaskPriority::Normal
 #endif
 
 #ifdef ARDA_NO_NAMES
@@ -124,12 +161,12 @@ enum class TaskPriority : uint8_t {
 #endif
 
 // Task structure - fields ordered to minimize padding.
-// Memory per task (with default ARDA_MAX_NAME_LEN=8):
-//   AVR (8-bit):  8 + 3*2 + 4*4 + 1 = ~31 bytes (23 bytes with ARDA_NO_NAMES)
-//   ESP8266/32:   8 + 3*4 + 4*4 + 1 = ~37 bytes (29 bytes with ARDA_NO_NAMES)
-//   32-bit ARM:   8 + 3*4 + 4*4 + 1 = ~37 bytes (29 bytes with ARDA_NO_NAMES)
-//   64-bit:       8 + 3*8 + 4*4 + 1 + padding = ~49 bytes (41 bytes with ARDA_NO_NAMES)
-// Total for 16 tasks: ~496 bytes (AVR), ~592 bytes (32-bit), ~784 bytes (64-bit)
+// Memory per task (with default ARDA_MAX_NAME_LEN=16):
+//   AVR (8-bit):  16 + 3*2 + 4*4 + 1 = ~39 bytes (23 bytes with ARDA_NO_NAMES)
+//   ESP8266/32:   16 + 3*4 + 4*4 + 1 = ~45 bytes (29 bytes with ARDA_NO_NAMES)
+//   32-bit ARM:   16 + 3*4 + 4*4 + 1 = ~45 bytes (29 bytes with ARDA_NO_NAMES)
+//   64-bit:       16 + 3*8 + 4*4 + 1 + padding = ~57 bytes (41 bytes with ARDA_NO_NAMES)
+// Total for 16 tasks: ~624 bytes (AVR), ~720 bytes (32-bit), ~912 bytes (64-bit)
 struct Task {
 #ifndef ARDA_NO_NAMES
     char name[ARDA_MAX_NAME_LEN]; // Copied, safe from dangling pointers; empty = deleted
@@ -138,7 +175,7 @@ struct Task {
     TaskCallback loop;            // Repeated execution callback
     TaskCallback teardown;        // Cleanup callback (called on stop)
     uint32_t interval;            // Run interval in ms (0 = every cycle)
-    uint32_t lastRun;             // Last execution time (for interval scheduling)
+    uint32_t lastRun;             // Actual execution time (for scheduling and getTaskLastRun)
     uint32_t timeout;             // Max execution time in ms (0 = disabled)
     // INVARIANT: This union shares memory between active and deleted task states.
     // - runCount: ONLY valid when task is not deleted. Read via getTaskRunCount().
@@ -149,7 +186,7 @@ struct Task {
         uint32_t runCount;        // Execution count (overflows after ~49 days at 1ms)
         int8_t nextFree;          // Next free slot index (-1 = end of list); internal use only
     };
-    // Packed flags: bits 0-1 = state, bit 2 = ranThisCycle, bit 3 = inYield
+    // Packed flags: bits 0-1 = state, bit 2 = ranThisCycle, bit 3 = inYield (if ARDA_YIELD)
     // When ARDA_NO_NAMES: state value 3 = deleted (ARDA_TASK_DELETED_STATE)
     // Bits 4-7: priority (when ARDA_NO_PRIORITY is not defined)
     uint8_t flags;
@@ -188,10 +225,11 @@ public:
     // Scheduler control
     // -------------------------------------------------------------------------
 
+    // Initialize scheduler and start all registered tasks.
     // Returns number of tasks started, or -1 if already begun (check hasBegun() first).
-    // Set autoStartTasks=false to initialize scheduler without starting registered tasks.
     // If startFailureCallback is set, it will be called for each task that fails to start.
-    int8_t begin(bool autoStartTasks = true);
+    // Use createTask(..., autoStart=false) if you need tasks to start in Stopped state.
+    int8_t begin();
 
     // Execute the scheduler. Returns false and sets error if begin() hasn't been called.
     bool run();
@@ -211,7 +249,8 @@ public:
 
 #ifdef ARDA_NO_NAMES
     // Simplified createTask without name parameter (ARDA_NO_NAMES mode).
-    // Returns -1 if max tasks reached or auto-start fails.
+    // Returns -1 if max tasks reached or auto-start fails (check getError()).
+    // Use autoStart=false to handle start failures manually.
     int8_t createTask(TaskCallback setup, TaskCallback loop,
                       uint32_t intervalMs = 0, TaskCallback teardown = nullptr,
                       bool autoStart = true);
@@ -225,38 +264,48 @@ public:
     // Name is copied, so the original string does not need to remain valid.
     // Name comparison is case-sensitive ("MyTask" != "mytask").
     // Returns -1 if: name is null/empty, name exceeds ARDA_MAX_NAME_LEN-1 chars,
-    // name is duplicate, max tasks reached, or auto-start fails.
+    // name is duplicate, max tasks reached, or auto-start fails (check getError()).
     // If begin() was already called and autoStart is true (default), the new task
-    // is automatically started; on start failure, the task is NOT created (-1 returned).
-    // Set autoStart=false to create a task in STOPPED state after begin().
-    // NOTE: begin(autoStartTasks=false) only affects tasks existing at begin() time.
-    // Tasks created after begin() follow their own autoStart parameter (default true).
+    // is automatically started. Use autoStart=false to handle start failures manually.
     int8_t createTask(const char* name, TaskCallback setup, TaskCallback loop,
                       uint32_t intervalMs = 0, TaskCallback teardown = nullptr,
                       bool autoStart = true);
 #endif
 
 #ifndef ARDA_NO_PRIORITY
-    // Create a task with explicit priority (0-15, higher runs first).
-    // See TaskPriority enum for named levels, or use raw values.
+    // Create a task with explicit priority (higher runs first).
+    // Priority is last to maintain consistent positional order with the standard overload:
+    // (name, setup, loop, interval, teardown, autoStart, priority)
+    // See TaskPriority enum for levels (Lowest=0 through Highest=4).
     int8_t createTask(const char* name, TaskCallback setup, TaskCallback loop,
-                      uint32_t intervalMs, uint8_t priority,
-                      TaskCallback teardown = nullptr, bool autoStart = true);
+                      uint32_t intervalMs, TaskCallback teardown,
+                      bool autoStart, TaskPriority priority);
 #endif
 
     bool deleteTask(int8_t taskId);
+
+    // Stop and delete a task in one operation. Handles already-stopped tasks gracefully.
+    // Returns false if: task invalid, teardown restarted task, or task is currently executing.
+    // Check getError() for details: InvalidId, StateChanged, TaskExecuting, TaskYielded.
+    bool killTask(int8_t taskId);
 
     // -------------------------------------------------------------------------
     // Task state control
     // -------------------------------------------------------------------------
 
-    // Start a stopped task. By default, interval-based tasks wait one full interval
-    // before their first execution. Set runImmediately=true to execute the first
-    // loop() call right away (on the next run() cycle), then resume normal interval timing.
-    // Note: runImmediately has no effect for zero-interval tasks (they run every cycle anyway).
+    // Start a stopped task. By default (runImmediately=false), the task waits until
+    // the next run() cycle. For interval-based tasks, it also waits one full interval.
+    // Set runImmediately=true to skip the initial interval wait for interval-based tasks.
+    // NOTE: Tasks started during a run() cycle cannot run in that same cycle regardless
+    // of this flag; they will run on the next cycle. The runImmediately flag primarily
+    // affects interval-based timing, not same-cycle execution.
     // NOTE: runCount is reset to 0 on each start. It tracks loop executions since the
     // most recent start, not cumulative runs across the task's lifetime.
-    bool startTask(int8_t taskId, bool runImmediately = false);
+    // Returns StartResult enum:
+    //   StartResult::Success: Task started, setup ran, task is Running
+    //   StartResult::SetupChangedState: Setup ran but changed state (getError() = StateChanged)
+    //   StartResult::Failed: Task couldn't be started (check getError())
+    StartResult startTask(int8_t taskId, bool runImmediately = false);
 
     bool pauseTask(int8_t taskId);
     bool resumeTask(int8_t taskId);
@@ -272,19 +321,19 @@ public:
     // Task configuration
     // -------------------------------------------------------------------------
 
-    // Change task interval. By default, resets lastRun to now (task waits full new interval).
-    // Set resetTiming=false to keep existing timing (next run based on previous lastRun + new interval).
-    bool setTaskInterval(int8_t taskId, uint32_t intervalMs, bool resetTiming = true);
+    // Change task interval. By default, keeps existing timing (next run based on lastRun + new interval).
+    // Set resetTiming=true to reset lastRun to now (task waits full new interval from now).
+    bool setTaskInterval(int8_t taskId, uint32_t intervalMs, bool resetTiming = false);
 
     bool setTaskTimeout(int8_t taskId, uint32_t timeoutMs);  // 0 = disabled
 
 #ifndef ARDA_NO_PRIORITY
-    // Set task priority (0-15, higher = runs first). Values > 15 are clamped to 15.
-    // Returns false if task is invalid.
-    bool setTaskPriority(int8_t taskId, uint8_t priority);
+    // Set task priority (higher = runs first). Returns false with InvalidValue if out of range.
+    // Returns false if task is invalid. See TaskPriority enum for valid levels.
+    bool setTaskPriority(int8_t taskId, TaskPriority priority);
 
-    // Get task priority (0-15). Returns 0 for invalid tasks.
-    uint8_t getTaskPriority(int8_t taskId) const;
+    // Get task priority. Returns TaskPriority::Lowest for invalid tasks.
+    TaskPriority getTaskPriority(int8_t taskId) const;
 #endif
 
     // Rename a task. Returns false if task invalid, name invalid, or name already exists.
@@ -305,7 +354,7 @@ public:
     // Convenience methods - operate on ALL non-deleted tasks
     // Returns count of successful operations.
     int8_t startAllTasks();
-    int8_t stopAllTasks();    // Returns count stopped (includes partial success: TeardownSkipped/TeardownChangedState)
+    int8_t stopAllTasks();    // Returns count stopped (includes TeardownSkipped; excludes TeardownChangedState since task restarted)
     int8_t pauseAllTasks();
     int8_t resumeAllTasks();
 
@@ -314,7 +363,6 @@ public:
     // -------------------------------------------------------------------------
 
     int8_t getTaskCount() const;        // Number of active (non-deleted) tasks
-    int8_t getActiveTaskCount() const;  // Alias for getTaskCount()
     int8_t getSlotCount() const;        // Total slots used (including deleted) - for iteration
     static constexpr int8_t getMaxTasks() { return ARDA_MAX_TASKS; }  // Maximum task capacity
 
@@ -327,10 +375,13 @@ public:
     uint32_t getTaskRunCount(int8_t taskId) const;  // Runs since last start (reset on each startTask)
     uint32_t getTaskInterval(int8_t taskId) const;
     uint32_t getTaskTimeout(int8_t taskId) const;
+    uint32_t getTaskLastRun(int8_t taskId) const;   // millis() snapshot when task last ran (0 if never ran or invalid)
 
     int8_t getCurrentTask() const;          // Returns ID of currently executing task, or -1
     bool isValidTask(int8_t taskId) const;  // Returns true if taskId refers to a non-deleted task
+#ifdef ARDA_YIELD
     bool isTaskYielded(int8_t taskId) const;  // Returns true if task is currently inside a yield() call
+#endif
 
     // Find task by name. Returns task ID or -1 if not found.
     // Name comparison is case-sensitive by default ("MyTask" != "mytask").
@@ -366,9 +417,11 @@ public:
     // Utility
     // -------------------------------------------------------------------------
 
+#ifdef ARDA_YIELD
     void yield();
+#endif
 
-    // Returns milliseconds since begin() was called, or millis() if not yet begun.
+    // Returns milliseconds since begin() was called, or 0 if not yet begun.
     uint32_t uptime() const;
 
     // -------------------------------------------------------------------------
@@ -379,14 +432,34 @@ public:
     void clearError();
     static const char* errorString(ArdaError error);  // Convert error code to string
 
+    // -------------------------------------------------------------------------
+    // Shell (requires: !ARDA_NO_SHELL && !ARDA_NO_GLOBAL_INSTANCE)
+    // -------------------------------------------------------------------------
+
+#ifdef ARDA_SHELL_ACTIVE
+    void setShellStream(Stream& stream);  // Default: Serial. WARNING: Stream must remain valid.
+    bool isShellRunning() const;          // True if shell task exists AND is Running
+    static constexpr int8_t getShellTaskId() { return ARDA_SHELL_TASK_ID; }
+    void exec(const char* cmd);           // Execute shell command programmatically
+#ifndef ARDA_NO_SHELL_ECHO
+    void setShellEcho(bool enabled);      // Echo commands back with "> " prefix (default: on)
+#endif
+
+#ifdef ARDA_SHELL_MANUAL_START
+    bool startShell();
+    bool stopShell();
+#endif
+#endif
+
 private:
     // Scheduler flags bit positions
-    static constexpr uint8_t FLAG_BEGUN  = 0x01;  // bit 0: begin() has been called
-    static constexpr uint8_t FLAG_IN_RUN = 0x02;  // bit 1: currently inside run()
+    static constexpr uint8_t FLAG_BEGUN    = 0x01;  // bit 0: begin() has been called
+    static constexpr uint8_t FLAG_IN_RUN   = 0x02;  // bit 1: currently inside run()
+    static constexpr uint8_t FLAG_IN_BEGIN = 0x04;  // bit 2: currently inside begin() task-start loop
 
     Task tasks[ARDA_MAX_TASKS];
     int8_t taskCount;        // Total slots used (including deleted) - for iteration bounds
-    int8_t activeCount;      // Active (non-deleted) tasks - O(1) query via getActiveTaskCount()
+    int8_t activeCount;      // Active (non-deleted) tasks - O(1) query via getTaskCount()
     uint32_t startTime;
     int8_t freeListHead;     // Head of free slot linked list (-1 if none) for O(1) allocation
     int8_t currentTask;      // ID of currently executing task (-1 if none)
@@ -403,9 +476,37 @@ private:
     void freeSlot(int8_t slot);  // Return slot to free list
     void runInternal(int8_t skipTask);  // Internal scheduler loop
     void emitTrace(int8_t taskId, TraceEvent event);  // Invoke trace callback with depth guard
+    int8_t initTaskFields_(int8_t id, TaskCallback setup, TaskCallback loop,
+                           uint32_t intervalMs, TaskCallback teardown, bool autoStart);  // Common task init
 
     // Case-insensitive string comparison helper (only used if ARDA_CASE_INSENSITIVE_NAMES defined)
     static bool nameEquals(const char* a, const char* b);
+
+#ifdef ARDA_SHELL_ACTIVE
+    Stream* shellStream_;
+    char shellBuf_[ARDA_SHELL_BUF_SIZE];
+    uint8_t shellBufIdx_;
+    bool shellBusy_;                      // Re-entrancy guard for exec()
+    bool shellDeleted_;                   // Track if shell task was deleted (for isShellRunning)
+    int8_t pendingSelfDelete_;            // Task ID pending self-deletion, or -1
+#ifndef ARDA_NO_SHELL_ECHO
+    bool shellEcho_;                      // Echo received commands back to stream
+#endif
+    void initShell_();                    // Initialize shell task in slot 0
+    void shellCmd_(uint8_t len);
+    void shellList_();
+#ifndef ARDA_SHELL_MINIMAL
+    void shellInfo_(int8_t id);
+    uint32_t shellParseArg2_(uint8_t len);  // Parse second numeric argument from command buffer
+#endif
+    friend void ardaShellLoop_();         // Static callback needs access
+#endif
+
+#ifdef ARDA_INTERNAL_TEST
+public:
+    // Test accessor for internal task state (e.g., overflow testing)
+    Task* getTaskPtr_(int8_t id) { return (id >= 0 && id < taskCount) ? &tasks[id] : nullptr; }
+#endif
 };
 
 // Global instance - define ARDA_NO_GLOBAL_INSTANCE before including Arda.h to disable

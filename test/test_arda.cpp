@@ -12,12 +12,21 @@
 // - Tests where callbacks need scheduler access use the global `OS` instance
 //   (e.g., yield tests, getCurrentTask tests, self-deletion tests)
 // - resetGlobalOS() reconstructs the global OS between tests using placement new
+//
+// Note: Shell is disabled for these tests to allow local Arda instances to
+// behave normally. Shell functionality is tested separately in test_shell.cpp.
 
 #include <cstdio>
 #include <cstring>
 #include <cassert>
 #include <new>
 #include "Arduino.h"
+
+// Disable shell for core tests (shell needs global OS instance)
+#define ARDA_NO_SHELL
+
+// Enable internal test accessor for Task* access without relying on memory layout
+#define ARDA_INTERNAL_TEST
 
 // Define mock variables
 uint32_t _mockMillis = 0;  // 32-bit to simulate Arduino's millis() ovrflow
@@ -26,6 +35,12 @@ MockSerial Serial;
 // Include Arda (unity build - header and implementation together)
 #include "../Arda.h"
 #include "../Arda.cpp"
+
+// Test helper to access internal task state (for overflow testing)
+// Uses ARDA_INTERNAL_TEST accessor instead of relying on class memory layout.
+Task* getTaskPtr(Arda& os, int8_t id) {
+    return os.getTaskPtr_(id);
+}
 
 // Test variables
 static int setup1Called = 0;
@@ -56,15 +71,6 @@ void task1_setup() { setup1Called++; }
 void task1_loop() { loop1Called++; }
 void task2_setup() { setup2Called++; }
 void task2_loop() { loop2Called++; }
-
-// For yield test - a task that calls yield
-static int yieldLoopCalled = 0;
-void yldTask_setup() {}
-void yldTask_loop() {
-    yieldLoopCalled++;
-    // This would cause infinite recursion without reentrancy guard
-    OS.yield();
-}
 
 // For trdwn test
 static int trdwnCalled = 0;
@@ -183,8 +189,8 @@ void test_invalid_operations() {
 
     Arda os;
 
-    // Operations on invalid task IDs should return false/StopResult::Failed
-    assert(os.startTask(99) == false);
+    // Operations on invalid task IDs should return Failed
+    assert(os.startTask(99) == StartResult::Failed);
     assert(os.pauseTask(-1) == false);
     assert(os.resumeTask(100) == false);
     assert(os.stopTask(50) == StopResult::Failed);
@@ -202,6 +208,184 @@ void test_invalid_operations() {
     printf("PASSED\n");
 }
 
+void test_resume_running_task() {
+    printf("Test: resumeTask on running (not paused) task... ");
+    resetTestCounters();
+
+    Arda os;
+    int8_t id = os.createTask("task", task1_setup, task1_loop, 0);
+    os.startTask(id);
+    assert(os.getTaskState(id) == TaskState::Running);
+
+    // Resuming a running task that was never paused should fail
+    assert(os.resumeTask(id) == false);
+    assert(os.getError() == ArdaError::WrongState);
+
+    // Task should still be running
+    assert(os.getTaskState(id) == TaskState::Running);
+
+    printf("PASSED\n");
+}
+
+void test_pause_already_paused_task() {
+    printf("Test: pauseTask on already paused task... ");
+    resetTestCounters();
+
+    Arda os;
+    int8_t id = os.createTask("task", task1_setup, task1_loop, 0);
+    os.startTask(id);
+
+    // First pause should succeed
+    assert(os.pauseTask(id) == true);
+    assert(os.getTaskState(id) == TaskState::Paused);
+    assert(os.getError() == ArdaError::Ok);
+
+    // Second pause should fail (already paused)
+    assert(os.pauseTask(id) == false);
+    assert(os.getError() == ArdaError::WrongState);
+
+    // Task should still be paused
+    assert(os.getTaskState(id) == TaskState::Paused);
+
+    printf("PASSED\n");
+}
+
+void test_double_resume() {
+    printf("Test: double resume after pause... ");
+    resetTestCounters();
+
+    Arda os;
+    int8_t id = os.createTask("task", task1_setup, task1_loop, 0);
+    os.startTask(id);
+    os.pauseTask(id);
+    assert(os.getTaskState(id) == TaskState::Paused);
+
+    // First resume should succeed
+    assert(os.resumeTask(id) == true);
+    assert(os.getTaskState(id) == TaskState::Running);
+    assert(os.getError() == ArdaError::Ok);
+
+    // Second resume should fail (now running, not paused)
+    assert(os.resumeTask(id) == false);
+    assert(os.getError() == ArdaError::WrongState);
+
+    printf("PASSED\n");
+}
+
+void test_set_interval_to_zero_dynamically() {
+    printf("Test: setTaskInterval to 0 dynamically... ");
+    resetTestCounters();
+
+    Arda os;
+    int8_t id = os.createTask("task", task1_setup, task1_loop, 1000);  // 1 second interval
+    os.begin();
+
+    // Task should not run immediately (lastRun set to current millis, interval not elapsed)
+    os.run();
+    assert(loop1Called == 0);
+
+    // Still doesn't run (interval not elapsed)
+    os.run();
+    assert(loop1Called == 0);
+
+    // Change interval to 0 (run every cycle)
+    assert(os.setTaskInterval(id, 0) == true);
+    assert(os.getTaskInterval(id) == 0);
+
+    // Now should run every cycle regardless of time
+    os.run();
+    assert(loop1Called == 1);
+    os.run();
+    assert(loop1Called == 2);
+    os.run();
+    assert(loop1Called == 3);
+
+    printf("PASSED\n");
+}
+
+void test_clear_error_preserves_state() {
+    printf("Test: clearError preserves scheduler state... ");
+    resetTestCounters();
+
+    Arda os;
+    int8_t id = os.createTask("task", task1_setup, task1_loop, 0);  // interval=0 runs every cycle
+    os.startTask(id);
+    os.begin();
+
+    // Cause an error
+    os.startTask(99);  // Invalid ID
+    assert(os.getError() == ArdaError::InvalidId);
+
+    // Clear the error
+    os.clearError();
+    assert(os.getError() == ArdaError::Ok);
+
+    // Verify scheduler state is unchanged
+    assert(os.getTaskState(id) == TaskState::Running);
+    assert(os.hasBegun() == true);
+    assert(os.getTaskInterval(id) == 0);
+
+    // Scheduler should still work
+    os.run();
+    assert(loop1Called >= 1);
+
+    printf("PASSED\n");
+}
+
+// For teardown-deletes-other-task test
+static int8_t teardownDeleteTargetId = -1;
+static bool teardownDeleteOtherCalled = false;
+
+void teardownDeleteOther_setup() {}
+void teardownDeleteOther_loop() {}
+void teardownDeleteOther_trdwn() {
+    teardownDeleteOtherCalled = true;
+    // Try to delete another task during our teardown
+    if (teardownDeleteTargetId >= 0) {
+        OS.deleteTask(teardownDeleteTargetId);
+    }
+}
+
+void test_teardown_deletes_other_running_task() {
+    printf("Test: teardown deletes another running task... ");
+    resetTestCounters();
+    teardownDeleteOtherCalled = false;
+
+    // Create two tasks - one whose teardown will try to delete the other
+    int8_t deleter = OS.createTask("deleter", teardownDeleteOther_setup,
+                                   teardownDeleteOther_loop, 0,
+                                   teardownDeleteOther_trdwn);
+    int8_t target = OS.createTask("target", task1_setup, task1_loop, 0);
+    teardownDeleteTargetId = target;
+
+    assert(deleter >= 0 && target >= 0);
+    OS.begin();
+
+    // Both should be running
+    assert(OS.getTaskState(deleter) == TaskState::Running);
+    assert(OS.getTaskState(target) == TaskState::Running);
+
+    // Stop the deleter - its teardown will try to delete the running target
+    StopResult result = OS.stopTask(deleter);
+
+    // Teardown ran
+    assert(teardownDeleteOtherCalled == true);
+
+    // The delete should have failed (target is running)
+    assert(OS.isValidTask(target));
+    assert(OS.getTaskState(target) == TaskState::Running);
+
+    // Deleter should be stopped
+    assert(OS.getTaskState(deleter) == TaskState::Stopped);
+
+    // Result should indicate teardown changed state (it tried to delete)
+    // Actually, since deleteTask fails on running task, state wasn't changed
+    // So result should be Success
+    assert(result == StopResult::Success);
+
+    printf("PASSED\n");
+}
+
 void test_setup_called_on_start() {
     printf("Test: setup called on start... ");
     resetTestCounters();
@@ -214,7 +398,7 @@ void test_setup_called_on_start() {
     assert(setup1Called == 1);
 
     // Starting again should fail (already running)
-    assert(os.startTask(id) == false);
+    assert(os.startTask(id) == StartResult::Failed);
     assert(setup1Called == 1); // Not called again
 
     printf("PASSED\n");
@@ -298,9 +482,9 @@ void test_uptime() {
 
     Arda os;
 
-    // Before begin(), uptime returns raw millis()
+    // Before begin(), uptime returns 0
     setMockMillis(5000);
-    assert(os.uptime() == 5000);
+    assert(os.uptime() == 0);
 
     setMockMillis(1000);  // Start at 1 second
     os.begin();
@@ -367,23 +551,6 @@ void test_millis_ovrflow_uptime() {
     printf("PASSED\n");
 }
 
-void test_yield_reentrancy() {
-    printf("Test: yield reentrancy guard... ");
-    resetTestCounters();
-    yieldLoopCalled = 0;
-
-    Arda os;
-    os.createTask("yldTask", yldTask_setup, yldTask_loop, 0);
-    os.begin();
-
-    // This would stack ovrflow without reentrancy guard
-    os.run();
-
-    // Task should have run exactly once despite calling yield()
-    assert(yieldLoopCalled == 1);
-
-    printf("PASSED\n");
-}
 
 void test_delete_task() {
     printf("Test: delete task... ");
@@ -415,6 +582,138 @@ void test_delete_task() {
     int8_t id3 = os.createTask("task3", task1_setup, task1_loop, 0);
     assert(id3 == 0);  // Reused slot 0
     assert(os.getTaskCount() == 2);      // Back to 2 active
+
+    printf("PASSED\n");
+}
+
+void test_kill_task_running() {
+    printf("Test: killTask on running task... ");
+    resetTestCounters();
+
+    Arda os;
+    int8_t id = os.createTask("task", task1_setup, task1_loop, 0);
+    os.startTask(id);
+    assert(os.getTaskState(id) == TaskState::Running);
+
+    // killTask should stop and delete in one call
+    assert(os.killTask(id) == true);
+    assert(os.getError() == ArdaError::Ok);
+
+    // Task should be gone
+    assert(!os.isValidTask(id));
+    assert(os.getTaskState(id) == TaskState::Invalid);
+
+    printf("PASSED\n");
+}
+
+void test_kill_task_stopped() {
+    printf("Test: killTask on already stopped task... ");
+    resetTestCounters();
+
+    Arda os;
+    int8_t id = os.createTask("task", task1_setup, task1_loop, 0);
+    // Task is created in Stopped state (not auto-started since no begin())
+    assert(os.getTaskState(id) == TaskState::Stopped);
+
+    // killTask should handle already-stopped gracefully
+    assert(os.killTask(id) == true);
+    assert(os.getError() == ArdaError::Ok);
+
+    // Task should be gone
+    assert(!os.isValidTask(id));
+
+    printf("PASSED\n");
+}
+
+void test_kill_task_paused() {
+    printf("Test: killTask on paused task... ");
+    resetTestCounters();
+
+    Arda os;
+    int8_t id = os.createTask("task", task1_setup, task1_loop, 0);
+    os.startTask(id);
+    os.pauseTask(id);
+    assert(os.getTaskState(id) == TaskState::Paused);
+
+    // killTask should stop (from paused) and delete
+    assert(os.killTask(id) == true);
+    assert(os.getError() == ArdaError::Ok);
+    assert(!os.isValidTask(id));
+
+    printf("PASSED\n");
+}
+
+void test_kill_task_invalid_id() {
+    printf("Test: killTask on invalid ID... ");
+    resetTestCounters();
+
+    Arda os;
+
+    assert(os.killTask(99) == false);
+    assert(os.getError() == ArdaError::InvalidId);
+
+    assert(os.killTask(-1) == false);
+    assert(os.getError() == ArdaError::InvalidId);
+
+    printf("PASSED\n");
+}
+
+// For killTask teardown-restarts test
+static int8_t killTrdwnRestartTaskId = -1;
+void killTrdwnRestart_trdwn() {
+    OS.startTask(killTrdwnRestartTaskId);  // Restart during teardown
+}
+
+void test_kill_task_teardown_restarts() {
+    printf("Test: killTask when teardown restarts task... ");
+    resetTestCounters();
+
+    // Create task whose teardown restarts itself
+    killTrdwnRestartTaskId = OS.createTask("restart", nullptr, nullptr, 0, killTrdwnRestart_trdwn);
+    assert(killTrdwnRestartTaskId >= 0);
+    OS.startTask(killTrdwnRestartTaskId);
+
+    // killTask should fail because teardown restarts the task
+    assert(OS.killTask(killTrdwnRestartTaskId) == false);
+    assert(OS.getError() == ArdaError::StateChanged);
+
+    // Task should still exist and be running (teardown restarted it)
+    assert(OS.isValidTask(killTrdwnRestartTaskId));
+    assert(OS.getTaskState(killTrdwnRestartTaskId) == TaskState::Running);
+
+    printf("PASSED\n");
+}
+
+void test_kill_task_self() {
+    printf("Test: killTask on self (from loop)... ");
+    resetTestCounters();
+
+    // killTask from within the task's own loop should fail with TaskExecuting
+    static int8_t selfKillTaskId = -1;
+    static bool selfKillAttempted = false;
+    static bool selfKillResult = true;
+    static ArdaError selfKillError = ArdaError::Ok;
+
+    selfKillAttempted = false;
+
+    auto selfKillLoop = []() {
+        if (!selfKillAttempted) {
+            selfKillAttempted = true;
+            selfKillResult = OS.killTask(selfKillTaskId);
+            selfKillError = OS.getError();
+        }
+    };
+
+    selfKillTaskId = OS.createTask("selfKil", nullptr, selfKillLoop, 0);
+    OS.begin();
+    OS.run();
+
+    assert(selfKillAttempted == true);
+    assert(selfKillResult == false);
+    assert(selfKillError == ArdaError::TaskExecuting);
+
+    // Task should still exist (couldn't kill itself)
+    assert(OS.isValidTask(selfKillTaskId));
 
     printf("PASSED\n");
 }
@@ -481,24 +780,126 @@ void test_run_count() {
     printf("PASSED\n");
 }
 
-void test_active_task_count() {
-    printf("Test: getActiveTaskCount... ");
+void test_getTaskLastRun_before_first_run() {
+    printf("Test: getTaskLastRun returns 0 before first loop execution... ");
     resetTestCounters();
 
     Arda os;
-    assert(os.getActiveTaskCount() == 0);
-    assert(os.getTaskCount() == 0);  // getTaskCount is now alias for getActiveTaskCount
+    _mockMillis = 100;  // Non-zero time
+
+    // Create task with autoStart=false to prevent auto-start
+    int8_t id = os.createTask("task", task1_setup, task1_loop, 500, nullptr, false);
+    os.begin();
+
+    // Task exists but hasn't been started yet
+    assert(os.getTaskState(id) == TaskState::Stopped);
+    assert(os.getTaskRunCount(id) == 0);
+    assert(os.getTaskLastRun(id) == 0);  // Never ran
+
+    // Start the task with runImmediately=false so it waits for interval
+    os.startTask(id, false);  // runImmediately=false
+    assert(os.getTaskState(id) == TaskState::Running);
+
+    // Task is running but hasn't executed its loop yet
+    // startTask() sets internal lastRun for scheduling, but runCount is still 0
+    assert(os.getTaskRunCount(id) == 0);
+    assert(os.getTaskLastRun(id) == 0);  // Should return 0 (never ran)
+
+    // Run scheduler - task won't execute yet (needs to wait interval)
+    _mockMillis = 200;
+    os.run();
+    assert(os.getTaskRunCount(id) == 0);  // Still waiting
+    assert(os.getTaskLastRun(id) == 0);   // Still "never ran"
+
+    // Advance time past interval and run
+    _mockMillis = 700;  // 600ms since startTask at t=100
+    os.run();
+    assert(os.getTaskRunCount(id) == 1);  // Now it ran
+    // lastRun is updated by interval scheduling logic, not just millis()
+    assert(os.getTaskLastRun(id) > 0);    // Has a valid timestamp now
+
+    printf("PASSED\n");
+}
+
+void test_getTaskLastRun_at_time_zero() {
+    printf("Test: getTaskLastRun at millis()==0... ");
+    resetTestCounters();
+
+    Arda os;
+    int8_t id = os.createTask("task", task1_setup, task1_loop, 0);
+    os.begin();
+
+    // Before any runs (but begin() already called startTask, setting internal lastRun)
+    assert(os.getTaskRunCount(id) == 0);
+    assert(os.getTaskLastRun(id) == 0);  // Never ran (runCount == 0)
+
+    // Run at millis() == 0
+    _mockMillis = 0;
+    os.run();
+
+    // Task has run (runCount > 0), lastRun == 0
+    assert(os.getTaskRunCount(id) == 1);
+    // getTaskLastRun returns 0 (the actual time) - same value but now runCount > 0
+    assert(os.getTaskLastRun(id) == 0);
+
+    // Run again at a later time to verify lastRun updates
+    _mockMillis = 100;
+    os.run();
+    assert(os.getTaskRunCount(id) == 2);
+    assert(os.getTaskLastRun(id) == 100);
+
+    printf("PASSED\n");
+}
+
+// Test helper to access internal task state for overflow testing
+// The Task struct is public, but Arda::tasks is private. We use a workaround.
+extern Task* getTaskPtr(Arda& os, int8_t id);
+
+void test_getTaskLastRun_runCount_overflow_skips_zero() {
+    printf("Test: getTaskLastRun runCount overflow skips 0... ");
+    resetTestCounters();
+
+    // This test verifies that runCount skips 0 on overflow, preserving the
+    // "never ran" semantics of runCount == 0.
+
+    Arda os;
+    int8_t id = os.createTask("task", task1_setup, task1_loop, 0);
+    os.begin();
+
+    // Run once at time 500
+    _mockMillis = 500;
+    os.run();
+    assert(os.getTaskRunCount(id) == 1);
+    assert(os.getTaskLastRun(id) == 500);
+
+    // Simulate being at UINT32_MAX (about to overflow)
+    Task* task = getTaskPtr(os, id);
+    task->runCount = UINT32_MAX;
+
+    // Run again - should wrap to 1, not 0
+    _mockMillis = 600;
+    os.run();
+    assert(os.getTaskRunCount(id) == 1);  // Wrapped UINT32_MAX -> 1, skipping 0
+    assert(os.getTaskLastRun(id) == 600);  // Still correctly reports last run time
+
+    printf("PASSED\n");
+}
+
+void test_get_task_count() {
+    printf("Test: getTaskCount... ");
+    resetTestCounters();
+
+    Arda os;
+    assert(os.getTaskCount() == 0);
 
     os.createTask("t1", task1_setup, task1_loop, 0);
     os.createTask("t2", task2_setup, task2_loop, 0);
-    assert(os.getActiveTaskCount() == 2);
-    assert(os.getTaskCount() == 2);  // Both are now the same
+    assert(os.getTaskCount() == 2);
 
     // Delete one task (must stop first)
     // Task is not started yet, so it's already stopped
     os.deleteTask(0);
-    assert(os.getActiveTaskCount() == 1);  // Only one active
-    assert(os.getTaskCount() == 1);        // getTaskCount also returns active count
+    assert(os.getTaskCount() == 1);        // Active count decreases
     assert(os.getSlotCount() == 2);        // Slot count stays at 2
 
     printf("PASSED\n");
@@ -637,8 +1038,8 @@ void test_nullptr_name_rejected() {
     printf("PASSED\n");
 }
 
-void test_interval_cadence() {
-    printf("Test: interval maintains cadence... ");
+void test_interval_minimum_gap() {
+    printf("Test: interval minimum gap... ");
     resetTestCounters();
 
     Arda os;
@@ -650,20 +1051,20 @@ void test_interval_cadence() {
     os.run();
     assert(loop1Called == 1);
 
-    // With cadence-based timing, next run should be at 200ms
-    // even if we check at 205ms (simulating slight delay)
+    // With actual-time tracking, next run is at 205 + 100 = 305ms
+    // because the task ran at t=205 (not scheduled 200ms)
     setMockMillis(205);
     os.run();
     assert(loop1Called == 2);
 
-    // Next run should be at 300ms (200 + 100), not 305ms
-    // At 299ms it should NOT run yet
-    setMockMillis(299);
+    // Next run should be at 305ms (205 + 100), not 300ms
+    // At 304ms it should NOT run yet
+    setMockMillis(304);
     os.run();
     assert(loop1Called == 2);  // Still 2
 
-    // At 300ms it should run
-    setMockMillis(300);
+    // At 305ms it should run
+    setMockMillis(305);
     os.run();
     assert(loop1Called == 3);
 
@@ -730,8 +1131,8 @@ void test_set_task_interval() {
     os.run();
     assert(loop1Called == 1);
 
-    // Change interval to 50ms - this resets lastRun to current time (100)
-    assert(os.setTaskInterval(id, 50) == true);
+    // Change interval to 50ms with resetTiming=true (resets lastRun to current time)
+    assert(os.setTaskInterval(id, 50, true) == true);
 
     // Should NOT run immediately since lastRun was reset to 100
     os.run();
@@ -792,96 +1193,6 @@ void test_get_task_interval() {
     // Deleted task should return 0
     os.deleteTask(id1);
     assert(os.getTaskInterval(id1) == 0);
-
-    printf("PASSED\n");
-}
-
-// For yield test - tracks which tasks ran
-static int yieldTestTask1Runs = 0;
-static int yieldTestTask2Runs = 0;
-static bool task1CalledYield = false;
-
-void yieldTest1_setup() {}
-void yieldTest1_loop() {
-    yieldTestTask1Runs++;
-    if (!task1CalledYield) {
-        task1CalledYield = true;
-        OS.yield();  // Should allow task2 to run
-    }
-}
-
-void yieldTest2_setup() {}
-void yieldTest2_loop() {
-    yieldTestTask2Runs++;
-}
-
-// For yield inRun restoration test
-static int yieldInRunTask1Runs = 0;
-static int yieldInRunTask2Runs = 0;
-static bool yieldInRunTestedReentrancy = false;
-
-void yieldInRunTask1_setup() {}
-void yieldInRunTask1_loop() {
-    yieldInRunTask1Runs++;
-    OS.yield();
-    // After yield returns, inRun should be true (restored)
-    // Calling run() here should be a no-op due to reentrancy guard
-    if (!yieldInRunTestedReentrancy) {
-        yieldInRunTestedReentrancy = true;
-        int beforeRuns = yieldInRunTask2Runs;
-        OS.run();  // Should be blocked by reentrancy guard
-        // Task2 should NOT have run again
-        assert(yieldInRunTask2Runs == beforeRuns);
-    }
-}
-
-void yieldInRunTask2_setup() {}
-void yieldInRunTask2_loop() {
-    yieldInRunTask2Runs++;
-}
-
-void test_yield_runs_other_tasks() {
-    printf("Test: yield runs other tasks... ");
-    resetTestCounters();
-    yieldTestTask1Runs = 0;
-    yieldTestTask2Runs = 0;
-    task1CalledYield = false;
-
-    OS.createTask("task1", yieldTest1_setup, yieldTest1_loop, 0);
-    OS.createTask("task2", yieldTest2_setup, yieldTest2_loop, 0);
-    OS.begin();
-
-    // One run cycle
-    OS.run();
-
-    // Task1 should have run once
-    assert(yieldTestTask1Runs == 1);
-    // Task2 should have run exactly once (ranThisCycle prevents double execution)
-    assert(yieldTestTask2Runs == 1);
-
-    printf("PASSED\n");
-}
-
-void test_yield_restores_inrun() {
-    printf("Test: yield restores inRun flag... ");
-    resetTestCounters();
-    yieldInRunTask1Runs = 0;
-    yieldInRunTask2Runs = 0;
-    yieldInRunTestedReentrancy = false;
-
-    OS.createTask("task1", yieldInRunTask1_setup, yieldInRunTask1_loop, 0);
-    OS.createTask("task2", yieldInRunTask2_setup, yieldInRunTask2_loop, 0);
-    OS.begin();
-
-    // One run cycle - task1 will call yield(), then try to call run()
-    // The run() call should be blocked because inRun should be true
-    OS.run();
-
-    // Task1 ran once, task2 ran once (ranThisCycle prevents double execution)
-    assert(yieldInRunTask1Runs == 1);
-    assert(yieldInRunTask2Runs == 1);
-    // The reentrancy test was executed
-    assert(yieldInRunTestedReentrancy == true);
 
     printf("PASSED\n");
 }
@@ -1057,17 +1368,18 @@ void test_reset_preserves_callbacks() {
 }
 
 void test_begin_no_autostart() {
-    printf("Test: begin(false) does not auto-start tasks... ");
+    printf("Test: createTask with autoStart=false does not auto-start... ");
     resetTestCounters();
 
     Arda os;
-    int8_t id1 = os.createTask("t1", task1_setup, task1_loop, 0);
-    int8_t id2 = os.createTask("t2", task2_setup, task2_loop, 0);
+    // Create tasks with autoStart=false
+    int8_t id1 = os.createTask("t1", task1_setup, task1_loop, 0, nullptr, false);
+    int8_t id2 = os.createTask("t2", task2_setup, task2_loop, 0, nullptr, false);
 
-    // begin(false) should initialize but not start tasks
-    int8_t result = os.begin(false);
-    assert(result == 0);  // 0 tasks started
-    assert(os.hasBegun() == true);  // But scheduler is begun
+    // begin() should initialize but tasks with autoStart=false stay stopped
+    int8_t result = os.begin();
+    assert(result == 0);  // 0 tasks started (both had autoStart=false)
+    assert(os.hasBegun() == true);  // Scheduler is begun
 
     // Tasks should still be in STOPPED state
     assert(os.getTaskState(id1) == TaskState::Stopped);
@@ -1081,6 +1393,42 @@ void test_begin_no_autostart() {
     os.startTask(id1);
     assert(os.getTaskState(id1) == TaskState::Running);
     assert(setup1Called == 1);
+
+    printf("PASSED\n");
+}
+
+void test_begin_with_prestarted_tasks() {
+    printf("Test: begin() skips already-running tasks... ");
+    resetTestCounters();
+
+    Arda os;
+    int8_t t1 = os.createTask("t1", task1_setup, task1_loop, 0);
+    int8_t t2 = os.createTask("t2", task2_setup, task2_loop, 0);
+    int8_t t3 = os.createTask("t3", task1_setup, task1_loop, 0);
+
+    // Manually start t2 before begin()
+    os.startTask(t2);
+    assert(os.getTaskState(t2) == TaskState::Running);
+    assert(setup2Called == 1);
+
+    // begin() should skip t2 (already Running) and start t1, t3
+    int8_t started = os.begin();
+
+    // All 3 tasks should count as "started" (t2 was already running, t1/t3 started by begin)
+    assert(started == 3);
+
+    // All tasks should be Running
+    assert(os.getTaskState(t1) == TaskState::Running);
+    assert(os.getTaskState(t2) == TaskState::Running);
+    assert(os.getTaskState(t3) == TaskState::Running);
+
+    // t2's setup was only called once (before begin), not twice
+    assert(setup2Called == 1);
+    // t1's setup was called by begin
+    assert(setup1Called == 2);  // t1 and t3 both use task1_setup
+
+    // No error should be set (all tasks successfully accounted for)
+    assert(os.getError() == ArdaError::Ok);
 
     printf("PASSED\n");
 }
@@ -1115,8 +1463,8 @@ void test_long_name_rejected() {
 
     Arda os;
 
-    // Names at exactly max length should work (7 chars + null = 8)
-    const char* maxName = "exact7!";  // 7 characters
+    // Names at exactly max length should work (15 chars + null = 16)
+    const char* maxName = "exactly15chars!";  // 15 characters
     assert(strlen(maxName) == ARDA_MAX_NAME_LEN - 1);
     int8_t id1 = os.createTask(maxName, task1_setup, task1_loop, 0);
     assert(id1 == 0);
@@ -1204,199 +1552,6 @@ void test_is_valid_task_public() {
     // Delete the task
     os.deleteTask(id);
     assert(os.isValidTask(id) == false);  // Now invalid (deleted)
-
-    printf("PASSED\n");
-}
-
-// For yield-in-setup test
-static int yieldSetupTask1Runs = 0;
-static int yieldSetupTask2Runs = 0;
-static bool yieldCalledInSetup = false;
-
-void yieldSetupTask1_setup() {
-    yieldCalledInSetup = true;
-    OS.yield();  // This used to corrupt inRun state
-}
-void yieldSetupTask1_loop() {
-    yieldSetupTask1Runs++;
-}
-
-void yieldSetupTask2_setup() {}
-void yieldSetupTask2_loop() {
-    yieldSetupTask2Runs++;
-}
-
-// For yield deletion prevention test - task B tries to delete task A while A is yielded
-static int8_t yieldDeleteTargetId = -1;
-static bool yieldDeleteAttempted = false;
-static StopResult yieldDeleteStopResult = StopResult::Failed;
-static ArdaError yieldDeleteStopError = ArdaError::Ok;
-static bool yieldDeleteResult = false;
-static int yieldDeleteTaskARuns = 0;
-static int yieldDeleteTaskBRuns = 0;
-
-void yieldDeleteTaskA_setup() {}
-void yieldDeleteTaskA_loop() {
-    yieldDeleteTaskARuns++;
-    OS.yield();  // Task B will try to delete us during this yield
-}
-
-void yieldDeleteTaskB_setup() {}
-void yieldDeleteTaskB_loop() {
-    yieldDeleteTaskBRuns++;
-    if (!yieldDeleteAttempted && yieldDeleteTargetId >= 0) {
-        yieldDeleteAttempted = true;
-        // Try to stop and delete task A while it's yielded
-        yieldDeleteStopResult = OS.stopTask(yieldDeleteTargetId);
-        yieldDeleteStopError = OS.getError();  // Capture error before deleteTask overwrites it
-        yieldDeleteResult = OS.deleteTask(yieldDeleteTargetId);
-    }
-}
-
-void test_yielded_task_deletion_prevented() {
-    printf("Test: yielded task stop and deletion prevented... ");
-    resetTestCounters();
-    yieldDeleteTargetId = -1;
-    yieldDeleteAttempted = false;
-    yieldDeleteStopResult = StopResult::Failed;
-    yieldDeleteStopError = ArdaError::Ok;
-    yieldDeleteResult = false;
-    yieldDeleteTaskARuns = 0;
-    yieldDeleteTaskBRuns = 0;
-
-    yieldDeleteTargetId = OS.createTask("taskA", yieldDeleteTaskA_setup, yieldDeleteTaskA_loop, 0);
-    OS.createTask("taskB", yieldDeleteTaskB_setup, yieldDeleteTaskB_loop, 0);
-    OS.begin();
-
-    // Run one cycle - task A will yield, task B will try to stop/delete task A
-    OS.run();
-
-    // Task B should have attempted stop/deletion
-    assert(yieldDeleteAttempted == true);
-    // Stop should fail (task is mid-yield, trdwn would corrupt stack)
-    assert(yieldDeleteStopResult == StopResult::Failed);
-    assert(yieldDeleteStopError == ArdaError::TaskYielded);
-    // Deletion should also fail (task is still running and in yield)
-    assert(yieldDeleteResult == false);
-
-    // Task A should still exist and be running (not stopped, not deleted)
-    assert(OS.getTaskName(yieldDeleteTargetId) != nullptr);
-    assert(OS.getTaskState(yieldDeleteTargetId) == TaskState::Running);
-
-    // After yield returns, task A is still running - now we can stop and delete it
-    OS.stopTask(yieldDeleteTargetId);
-    assert(OS.getTaskState(yieldDeleteTargetId) == TaskState::Stopped);
-
-    bool postYieldDelete = OS.deleteTask(yieldDeleteTargetId);
-    assert(postYieldDelete == true);
-    assert(OS.getTaskName(yieldDeleteTargetId) == nullptr);
-
-    printf("PASSED\n");
-}
-
-// For testing that startTask() resets inYield flag
-static int8_t yieldRestartTargetId = -1;
-static bool yieldRestartStopAttempted = false;
-static bool yieldRestartStartAttempted = false;
-static StopResult yieldRestartStopResult1 = StopResult::Failed;
-static bool yieldRestartStartResult = false;
-static StopResult yieldRestartStopResult2 = StopResult::Failed;
-static bool yieldRestartDeleteResult = false;
-static int yieldRestartTaskARuns = 0;
-static int yieldRestartTaskBRuns = 0;
-
-void yieldRestartTaskA_setup() {}
-void yieldRestartTaskA_loop() {
-    yieldRestartTaskARuns++;
-    OS.yield();  // Task B will stop, restart, then stop+delete us during this yield
-}
-
-void yieldRestartTaskB_setup() {}
-void yieldRestartTaskB_loop() {
-    yieldRestartTaskBRuns++;
-    if (!yieldRestartStopAttempted && yieldRestartTargetId >= 0) {
-        yieldRestartStopAttempted = true;
-        // First stop attempt should fail (task A is yielded)
-        yieldRestartStopResult1 = OS.stopTask(yieldRestartTargetId);
-    }
-}
-
-void test_startTask_resets_inYield_flag() {
-    printf("Test: startTask resets inYield flag... ");
-    resetTestCounters();
-    yieldRestartTargetId = -1;
-    yieldRestartStopAttempted = false;
-    yieldRestartStartAttempted = false;
-    yieldRestartStopResult1 = StopResult::Failed;
-    yieldRestartStartResult = false;
-    yieldRestartStopResult2 = StopResult::Failed;
-    yieldRestartDeleteResult = false;
-    yieldRestartTaskARuns = 0;
-    yieldRestartTaskBRuns = 0;
-
-    yieldRestartTargetId = OS.createTask("taskA", yieldRestartTaskA_setup, yieldRestartTaskA_loop, 0);
-    OS.createTask("taskB", yieldRestartTaskB_setup, yieldRestartTaskB_loop, 0);
-    OS.begin();
-
-    // Run one cycle - task A yields, task B tries to stop (which should fail)
-    OS.run();
-
-    // Verify stop failed because task A was mid-yield
-    assert(yieldRestartStopAttempted == true);
-    assert(yieldRestartStopResult1 == StopResult::Failed);
-    assert(OS.getTaskState(yieldRestartTargetId) == TaskState::Running);
-
-    // After yield returns, task A is no longer yielded - we can stop it
-    StopResult stopAfterYield = OS.stopTask(yieldRestartTargetId);
-    assert(stopAfterYield == StopResult::Success);
-    assert(OS.getTaskState(yieldRestartTargetId) == TaskState::Stopped);
-
-    // Restart task A
-    bool restartResult = OS.startTask(yieldRestartTargetId);
-    assert(restartResult == true);
-    assert(OS.getTaskState(yieldRestartTargetId) == TaskState::Running);
-
-    // Verify inYield was reset - task should not be considered yielded
-    assert(OS.isTaskYielded(yieldRestartTargetId) == false);
-
-    // Stop and delete should both succeed now
-    StopResult stopResult = OS.stopTask(yieldRestartTargetId);
-    assert(stopResult == StopResult::Success);
-
-    bool deleteResult = OS.deleteTask(yieldRestartTargetId);
-    assert(deleteResult == true);
-    assert(OS.getTaskName(yieldRestartTargetId) == nullptr);
-
-    printf("PASSED\n");
-}
-
-void test_yield_in_setup_does_not_corrupt_inrun() {
-    printf("Test: yield in setup does not corrupt inRun... ");
-    resetTestCounters();
-    yieldSetupTask1Runs = 0;
-    yieldSetupTask2Runs = 0;
-    yieldCalledInSetup = false;
-
-    OS.createTask("task1", yieldSetupTask1_setup, yieldSetupTask1_loop, 0);
-    OS.createTask("task2", yieldSetupTask2_setup, yieldSetupTask2_loop, 0);
-
-    // begin() will call startTask() which calls setup(), which calls yield()
-    // This used to set inRun=true permanently, blocking all future run() calls
-    OS.begin();
-
-    assert(yieldCalledInSetup == true);  // Verify setup ran and called yield
-
-    // If inRun is stuck at true, this run() will be a no-op
-    OS.run();
-
-    // Both tasks should have run once
-    assert(yieldSetupTask1Runs == 1);
-    assert(yieldSetupTask2Runs == 1);
-
-    // Run again to make sure scheduler is still working
-    OS.run();
-    assert(yieldSetupTask1Runs == 2);
-    assert(yieldSetupTask2Runs == 2);
 
     printf("PASSED\n");
 }
@@ -1565,8 +1720,8 @@ void test_set_interval_paused_task() {
     setMockMillis(150);
     os.pauseTask(id);
 
-    // Change interval while paused - this should reset lastRun to 150ms
-    os.setTaskInterval(id, 50);
+    // Change interval while paused with resetTiming=true (resets lastRun to 150ms)
+    os.setTaskInterval(id, 50, true);
     assert(os.getError() == ArdaError::Ok);
 
     // Resume at 160ms
@@ -1620,8 +1775,8 @@ void test_callback_depth_limit() {
 
     // Start task 0, which will recursively try to start task 1, 2, 3...
     // This should be limited by ARDA_MAX_CALLBACK_DEPTH
-    bool result = OS.startTask(depthTestTaskIds[0]);
-    assert(result == true);
+    StartResult result = OS.startTask(depthTestTaskIds[0]);
+    assert(result == StartResult::Success);
 
     // Due to the depth limit, we should see exactly ARDA_MAX_CALLBACK_DEPTH setups called
     // (the (ARDA_MAX_CALLBACK_DEPTH + 1)th should fail due to depth limit)
@@ -1726,28 +1881,6 @@ void test_reset_returns_true_when_all_trdwns_run() {
     printf("PASSED\n");
 }
 
-void test_is_task_yielded() {
-    printf("Test: isTaskYielded... ");
-    resetTestCounters();
-
-    // Outside of any task, should return false for all
-    assert(OS.isTaskYielded(-1) == false);
-    assert(OS.isTaskYielded(0) == false);
-    assert(OS.isTaskYielded(99) == false);
-
-    int8_t id = OS.createTask("task", task1_setup, task1_loop, 0);
-    assert(OS.isTaskYielded(id) == false);
-
-    OS.begin();
-    assert(OS.isTaskYielded(id) == false);
-
-    // The yieldDeleteTaskA test already verifies inYield is set during yield
-    // We just need to verify the public API works
-
-    printf("PASSED\n");
-}
-
-
 void test_null_loop_function() {
     printf("Test: null loop function task... ");
     resetTestCounters();
@@ -1772,27 +1905,6 @@ void test_null_loop_function() {
 
     // Run count should stay at 0 since loop is null
     assert(os.getTaskRunCount(id) == 0);
-
-    printf("PASSED\n");
-}
-
-void test_yield_outside_task_context() {
-    printf("Test: yield outside task context... ");
-    resetTestCounters();
-
-    Arda os;
-    os.createTask("task", task1_setup, task1_loop, 0);
-    os.begin();
-
-    // Calling yield() outside of any task should be a safe no-op
-    // (currentTask is -1 when not in a task callback)
-    assert(os.getCurrentTask() == -1);
-    os.yield();  // Should not crash or cause issues
-    assert(os.getCurrentTask() == -1);
-
-    // Scheduler should still work normally
-    os.run();
-    assert(loop1Called == 1);
 
     printf("PASSED\n");
 }
@@ -1822,7 +1934,7 @@ void test_deleted_slot_reuse() {
     // Delete task 1 (middle)
     os.deleteTask(1);
     assert(os.getSlotCount() == 5);      // Slot count stays same
-    assert(os.getActiveTaskCount() == 4);
+    assert(os.getTaskCount() == 4);
     assert(os.getTaskCount() == 4);      // Active count decreases
 
     // New task should reuse slot 1 (the only deleted slot)
@@ -1833,7 +1945,7 @@ void test_deleted_slot_reuse() {
     // Delete tasks 0 and 3
     os.deleteTask(0);
     os.deleteTask(3);
-    assert(os.getActiveTaskCount() == 3);
+    assert(os.getTaskCount() == 3);
 
     // New tasks should reuse deleted slots (order may vary due to free list LIFO)
     int8_t newId2 = os.createTask("new2", task2_setup, task2_loop, 0);
@@ -1846,7 +1958,7 @@ void test_deleted_slot_reuse() {
     assert(os.getSlotCount() == 5);      // Slot count still unchanged
 
     // Now all slots 0-4 are used again
-    assert(os.getActiveTaskCount() == 5);
+    assert(os.getTaskCount() == 5);
     assert(os.getTaskCount() == 5);
 
     // Next task should get slot 5 (new slot, no deleted slots available)
@@ -1876,11 +1988,11 @@ void test_setup_self_stop_returns_false() {
     setupSelfStopTaskId = OS.createTask("slStop", setupSelfStop_setup, setupSelfStop_loop, 0);
     assert(setupSelfStopTaskId >= 0);
 
-    // Starting should fail because setup stops the task
-    bool result = OS.startTask(setupSelfStopTaskId);
+    // Starting should return SetupChangedState because setup stops the task
+    StartResult result = OS.startTask(setupSelfStopTaskId);
 
     assert(setupSelfStopCalled == true);  // Setup did run
-    assert(result == false);               // But startTask returns false
+    assert(result == StartResult::SetupChangedState);  // Setup changed state
     assert(OS.getError() == ArdaError::StateChanged);
     assert(OS.getTaskState(setupSelfStopTaskId) == TaskState::Stopped);
 
@@ -1925,23 +2037,27 @@ void test_trdwn_self_restart_returns_partial() {
 void test_error_string() {
     printf("Test: errorString... ");
 
-    // Verify all error codes have string representations
-    assert(strncmp(Arda::errorString(ArdaError::Ok), "OK", 16) == 0);
-    assert(strncmp(Arda::errorString(ArdaError::NullName), "NULL_NAME", 16) == 0);
-    assert(strncmp(Arda::errorString(ArdaError::EmptyName), "EMPTY_NAME", 16) == 0);
-    assert(strncmp(Arda::errorString(ArdaError::NameTooLong), "NAME_TOO_LONG", 16) == 0);
-    assert(strncmp(Arda::errorString(ArdaError::DuplicateName), "DUPLICATE_NAME", 16) == 0);
-    assert(strncmp(Arda::errorString(ArdaError::MaxTasks), "MAX_TASKS", 16) == 0);
-    assert(strncmp(Arda::errorString(ArdaError::InvalidId), "INVALID_ID", 16) == 0);
-    assert(strncmp(Arda::errorString(ArdaError::WrongState), "WRONG_STATE", 16) == 0);
-    assert(strncmp(Arda::errorString(ArdaError::TaskExecuting), "TASK_EXECUTING", 16) == 0);
-    assert(strncmp(Arda::errorString(ArdaError::TaskYielded), "TASK_YIELDED", 16) == 0);
-    assert(strncmp(Arda::errorString(ArdaError::AlreadyBegun), "ALREADY_BEGUN", 16) == 0);
-    assert(strncmp(Arda::errorString(ArdaError::CallbackDepth), "CALLBACK_DEPTH", 16) == 0);
-    assert(strncmp(Arda::errorString(ArdaError::StateChanged), "STATE_CHANGED", 16) == 0);
+    // Verify all error codes have human-readable string representations
+    assert(strncmp(Arda::errorString(ArdaError::Ok), "No error", 32) == 0);
+    assert(strncmp(Arda::errorString(ArdaError::NullName), "Task name is null", 32) == 0);
+    assert(strncmp(Arda::errorString(ArdaError::EmptyName), "Task name is empty", 32) == 0);
+    assert(strncmp(Arda::errorString(ArdaError::NameTooLong), "Task name too long", 32) == 0);
+    assert(strncmp(Arda::errorString(ArdaError::DuplicateName), "Task name already exists", 32) == 0);
+    assert(strncmp(Arda::errorString(ArdaError::MaxTasks), "Max tasks reached", 32) == 0);
+    assert(strncmp(Arda::errorString(ArdaError::InvalidId), "Invalid task ID", 32) == 0);
+    assert(strncmp(Arda::errorString(ArdaError::WrongState), "Wrong task state", 32) == 0);
+    assert(strncmp(Arda::errorString(ArdaError::TaskExecuting), "Task is executing", 32) == 0);
+#ifdef ARDA_YIELD
+    assert(strncmp(Arda::errorString(ArdaError::TaskYielded), "Task has yielded", 32) == 0);
+#endif
+    assert(strncmp(Arda::errorString(ArdaError::AlreadyBegun), "Already begun", 32) == 0);
+    assert(strncmp(Arda::errorString(ArdaError::CallbackDepth), "Callback depth exceeded", 32) == 0);
+    assert(strncmp(Arda::errorString(ArdaError::StateChanged), "State changed unexpectedly", 32) == 0);
+    assert(strncmp(Arda::errorString(ArdaError::InCallback), "Cannot call from callback", 32) == 0);
+    assert(strncmp(Arda::errorString(ArdaError::NotSupported), "Not supported", 32) == 0);
 
-    // Unknown error code should return "UNKNOWN"
-    assert(strncmp(Arda::errorString((ArdaError)99), "UNKNOWN", 16) == 0);
+    // Unknown error code should return "Unknown error"
+    assert(strncmp(Arda::errorString((ArdaError)99), "Unknown error", 32) == 0);
 
     printf("PASSED\n");
 }
@@ -1951,9 +2067,9 @@ void test_version_constants() {
 
     // Verify version constants are defined and accessible
     assert(ARDA_VERSION_MAJOR == 1);
-    assert(ARDA_VERSION_MINOR == 0);
+    assert(ARDA_VERSION_MINOR == 1);
     assert(ARDA_VERSION_PATCH == 0);
-    assert(strncmp(ARDA_VERSION_STRING, "1.0.0", 16) == 0);
+    assert(strncmp(ARDA_VERSION_STRING, "1.1.0", 16) == 0);
 
     printf("PASSED\n");
 }
@@ -2010,7 +2126,7 @@ void autoStartDepthTask_setup() {
 }
 void autoStartDepthTask_loop() {}
 
-void test_createTask_autostart_failure_preserves_error() {
+void test_createTask_autostart_failure_returns_negative_one() {
     printf("Test: createTask auto-start failure returns -1... ");
     resetTestCounters();
     autoStartDepthSetupCalls = 0;
@@ -2026,68 +2142,99 @@ void test_createTask_autostart_failure_preserves_error() {
     static char name0[] = "auto0";
     autoStartDepthTaskIds[0] = OS.createTask(name0, autoStartDepthTask_setup, autoStartDepthTask_loop, 0);
 
-    // First task should have valid ID
+    // First task should have valid ID and be running
     assert(autoStartDepthTaskIds[0] >= 0);
+    assert(OS.getTaskState(autoStartDepthTaskIds[0]) == TaskState::Running);
 
-    // With the new semantics: when createTask's auto-start fails due to callback depth,
-    // it returns -1 and cleans up the task (doesn't leave it in STOPPED state).
-    // So we should find that some nested createTask returned -1.
-    bool foundFailedCreate = false;
+    // When auto-start fails due to callback depth, createTask returns -1
+    // and the task is deleted. Count how many succeeded vs failed.
+    int successCount = 1;  // First task succeeded
+    int failCount = 0;
     for (int i = 1; i <= ARDA_MAX_CALLBACK_DEPTH + 1; i++) {
-        if (autoStartDepthTaskIds[i] == -1) {
-            foundFailedCreate = true;
-            break;
-        }
-    }
-    // Due to callback depth limit, at least one createTask should have returned -1
-    assert(foundFailedCreate == true);
-
-    // Verify no "orphaned" tasks in STOPPED state exist (all valid IDs are RUNNING)
-    for (int i = 0; i <= ARDA_MAX_CALLBACK_DEPTH + 1; i++) {
         if (autoStartDepthTaskIds[i] >= 0) {
-            // If we have a valid ID, the task should be RUNNING (not orphaned in STOPPED)
+            successCount++;
+            // Successful tasks should be Running
             assert(OS.getTaskState(autoStartDepthTaskIds[i]) == TaskState::Running);
+        } else {
+            failCount++;
         }
     }
+
+    // Due to callback depth limit, at least one task should have failed (returned -1)
+    assert(failCount > 0);
 
     printf("PASSED\n");
+}
+
+// Setup that stops itself, causing startTask to return false with StateChanged error
+static int selfStopSetupCalls = 0;
+void selfStopSetup() {
+    selfStopSetupCalls++;
+    // Stop ourselves during setup - this causes startTask to fail
+    OS.stopTask(OS.getCurrentTask());
 }
 
 void test_begin_partial_failure_preserves_error() {
     printf("Test: begin partial failure preserves error... ");
     resetTestCounters();
+    selfStopSetupCalls = 0;
 
-    // Create a task whose setup will fail by hitting callback depth
-    // We'll do this by having setup recursively start tasks
-    depthTestSetupCalls = 0;
-    depthTestCurrentIndex = 0;
-
-    static char names[ARDA_MAX_CALLBACK_DEPTH + 2][16];
-    for (int i = 0; i < ARDA_MAX_CALLBACK_DEPTH + 2; i++) {
-        snprintf(names[i], sizeof(names[i]), "begin%d", i);
-        depthTestTaskIds[i] = OS.createTask(names[i], depthTestTask_setup, depthTestTask_loop, 0);
-        assert(depthTestTaskIds[i] >= 0);
-    }
+    // Create two normal tasks and one that will fail during setup (last, so error is preserved)
+    int8_t t1 = OS.createTask("good1", task1_setup, task1_loop, 0);
+    int8_t t2 = OS.createTask("good2", task2_setup, task2_loop, 0);
+    int8_t t3 = OS.createTask("fail", selfStopSetup, task1_loop, 0);  // This will fail (last)
+    assert(t1 >= 0 && t2 >= 0 && t3 >= 0);
 
     // begin() will try to start all tasks
-    // Task 0's setup will recursively start task 1, 2, etc.
-    // Eventually hitting callback depth limit
+    // "fail" task's setup stops itself, causing StateChanged error
     int8_t started = OS.begin();
 
-    // Not all tasks should have started
-    assert(started < ARDA_MAX_CALLBACK_DEPTH + 2);
+    // good1 + good2 = 2 tasks should have started (fail task failed)
+    // Note: shell is disabled in test_arda.cpp
+    assert(started == 2);
 
-    // Error should NOT be ArdaError::Ok since some tasks failed to start
-    // (The last failed startTask sets the error)
-    assert(OS.getError() != ArdaError::Ok);
+    // Error should be StateChanged from the failed task (it's last so error preserved)
+    assert(OS.getError() == ArdaError::StateChanged);
+
+    // The setup was called but task ended up Stopped
+    assert(selfStopSetupCalls == 1);
+    assert(OS.getTaskState(t3) == TaskState::Stopped);
+
+    printf("PASSED\n");
+}
+
+void test_begin_partial_failure_first_task_preserves_error() {
+    printf("Test: begin partial failure (first task) preserves error... ");
+    resetTestCounters();
+    selfStopSetupCalls = 0;
+
+    // Create failing task FIRST, then successful task - tests that later success doesn't mask error
+    int8_t t1 = OS.createTask("fail", selfStopSetup, task1_loop, 0);  // This will fail (first)
+    int8_t t2 = OS.createTask("good", task1_setup, task1_loop, 0);    // This succeeds (second)
+    assert(t1 >= 0 && t2 >= 0);
+
+    // begin() will try to start all tasks
+    int8_t started = OS.begin();
+
+    // Only "good" should have started
+    assert(started == 1);
+
+    // Error should still be StateChanged from the first failed task,
+    // not Ok (which would be the bug - successful task masking the error)
+    assert(OS.getError() == ArdaError::StateChanged);
+
+    // Verify states
+    assert(selfStopSetupCalls == 1);
+    assert(OS.getTaskState(t1) == TaskState::Stopped);
+    assert(OS.getTaskState(t2) == TaskState::Running);
 
     printf("PASSED\n");
 }
 
 void test_error_string_in_callback() {
-    printf("Test: errorString IN_CALLBACK... ");
+    printf("Test: errorString InCallback... ");
 
-    assert(strncmp(Arda::errorString(ArdaError::InCallback), "IN_CALLBACK", 16) == 0);
+    assert(strncmp(Arda::errorString(ArdaError::InCallback), "Cannot call from callback", 32) == 0);
 
     printf("PASSED\n");
 }
@@ -2212,29 +2359,28 @@ void test_start_failure_callback() {
     startFailureCount = 0;
     lastFailedTaskId = -1;
     lastFailureError = ArdaError::Ok;
-    depthTestSetupCalls = 0;
-    depthTestCurrentIndex = 0;
+    selfStopSetupCalls = 0;
 
     OS.setStartFailureCallback(startFailureCallback);
 
-    // Create chain of tasks that will hit callback depth limit during begin()
-    static char names[ARDA_MAX_CALLBACK_DEPTH + 2][16];
-    for (int i = 0; i < ARDA_MAX_CALLBACK_DEPTH + 2; i++) {
-        snprintf(names[i], sizeof(names[i]), "fail%d", i);
-        depthTestTaskIds[i] = OS.createTask(names[i], depthTestTask_setup, depthTestTask_loop, 0);
-        assert(depthTestTaskIds[i] >= 0);
-    }
+    // Create tasks, one of which will fail during setup
+    int8_t t1 = OS.createTask("good1", task1_setup, task1_loop, 0);
+    int8_t t2 = OS.createTask("good2", task2_setup, task2_loop, 0);
+    int8_t t3 = OS.createTask("fail", selfStopSetup, task1_loop, 0);  // This will fail
+    assert(t1 >= 0 && t2 >= 0 && t3 >= 0);
 
-    // begin() will try to start all tasks, some will fail due to callback depth
+    // begin() will try to start all tasks
+    // "fail" task's setup stops itself, triggering the callback
     int8_t started = OS.begin();
 
-    // Some tasks should have failed to start
-    assert(started < ARDA_MAX_CALLBACK_DEPTH + 2);
+    // good1 + good2 = 2 tasks should have started successfully
+    // Note: shell is disabled in test_arda.cpp
+    assert(started == 2);
 
-    // Callback should have been called at least once
-    assert(startFailureCount > 0);
-    assert(lastFailedTaskId >= 0);
-    assert(lastFailureError != ArdaError::Ok);
+    // Callback should have been called exactly once (for the failed task)
+    assert(startFailureCount == 1);
+    assert(lastFailedTaskId == t3);
+    assert(lastFailureError == ArdaError::StateChanged);
 
     printf("PASSED\n");
 }
@@ -2249,6 +2395,17 @@ void test_stop_result_enum_values() {
     assert(StopResult::TeardownSkipped != StopResult::TeardownChangedState);
     assert(StopResult::TeardownSkipped != StopResult::Failed);
     assert(StopResult::TeardownChangedState != StopResult::Failed);
+
+    printf("PASSED\n");
+}
+
+void test_start_result_enum_values() {
+    printf("Test: StartResult enum values are distinct... ");
+
+    // Verify enum values are distinct and can be tested
+    assert(StartResult::Success != StartResult::SetupChangedState);
+    assert(StartResult::Success != StartResult::Failed);
+    assert(StartResult::SetupChangedState != StartResult::Failed);
 
     printf("PASSED\n");
 }
@@ -2404,8 +2561,8 @@ void test_trace_callback() {
 
     OS.setTraceCallback(traceCallback);
 
-    int8_t id = OS.createTask("traced", task1_setup, task1_loop, 0);
-    OS.begin(false);  // Initialize scheduler without auto-starting tasks
+    int8_t id = OS.createTask("traced", task1_setup, task1_loop, 0, nullptr, false);
+    OS.begin();  // Initialize scheduler (task has autoStart=false so stays stopped)
     OS.startTask(id);
 
     // Should have seen STARTING and STARTED events
@@ -2507,8 +2664,8 @@ void depthTraceTask_trdwn() {
     }
 }
 
-void test_trace_stopped_emitted_on_callback_depth() {
-    printf("Test: TaskStopped emitted even when callback depth exceeded... ");
+void test_trace_skipped_on_callback_depth() {
+    printf("Test: traces skipped when callback depth exceeded... ");
     resetTestCounters();
     resetGlobalOS();
     traceStoppedCount = 0;
@@ -2534,42 +2691,47 @@ void test_trace_stopped_emitted_on_callback_depth() {
     // This will eventually hit callback depth limit
     OS.stopTask(depthTraceTaskIds[0]);
 
-    // Key assertion: TaskStopped should be emitted for ALL stopped tasks,
-    // including those where trdwn was skipped due to callback depth.
-    // Previously, TaskStopped was not emitted when callback depth exceeded.
-    // We expect all tasks from 0 to ARDA_MAX_CALLBACK_DEPTH to have TaskStopped emitted.
-    assert(traceStoppedCount == ARDA_MAX_CALLBACK_DEPTH + 1);
+    // Tasks are stopped (state changes happen regardless of trace depth)
+    // but traces are skipped when depth is at the limit
+    // We expect fewer TaskStopped traces than tasks stopped
+    assert(traceStoppedCount < ARDA_MAX_CALLBACK_DEPTH + 1);
+    assert(traceStoppedCount > 0);  // At least some traces fired
+
+    // Verify tasks are actually stopped despite traces being skipped
+    for (int i = 0; i < ARDA_MAX_CALLBACK_DEPTH + 1; i++) {
+        assert(OS.getTaskState(depthTraceTaskIds[i]) == TaskState::Stopped);
+    }
 
     printf("PASSED\n");
 }
 
-void test_active_count_o1() {
-    printf("Test: getActiveTaskCount is O(1)... ");
+void test_task_count_o1() {
+    printf("Test: getTaskCount is O(1)... ");
     resetTestCounters();
 
     Arda os;
 
-    assert(os.getActiveTaskCount() == 0);
+    assert(os.getTaskCount() == 0);
 
     // Create tasks
     int8_t id1 = os.createTask("t1", task1_setup, task1_loop, 0);
-    assert(os.getActiveTaskCount() == 1);
+    assert(os.getTaskCount() == 1);
 
     int8_t id2 = os.createTask("t2", task2_setup, task2_loop, 0);
-    assert(os.getActiveTaskCount() == 2);
+    assert(os.getTaskCount() == 2);
 
     // Delete one
     os.deleteTask(id1);
-    assert(os.getActiveTaskCount() == 1);
+    assert(os.getTaskCount() == 1);
 
     // Create another (reuses slot)
     int8_t id3 = os.createTask("t3", task1_setup, task1_loop, 0);
-    assert(os.getActiveTaskCount() == 2);
+    assert(os.getTaskCount() == 2);
 
     // Delete both
     os.deleteTask(id2);
     os.deleteTask(id3);
-    assert(os.getActiveTaskCount() == 0);
+    assert(os.getTaskCount() == 0);
 
     printf("PASSED\n");
 }
@@ -2711,7 +2873,7 @@ void test_free_list_o1_allocation() {
         // Create new task - should reuse deleted slot (O(1)) or allocate new
         int8_t id = os.createTask(name, task1_setup, task1_loop, 0);
         assert(id >= 0);
-        assert(os.getActiveTaskCount() <= ARDA_MAX_TASKS);
+        assert(os.getTaskCount() <= ARDA_MAX_TASKS);
     }
 
     printf("PASSED\n");
@@ -2723,16 +2885,35 @@ void test_batch_null_array() {
 
     Arda os;
 
-    // All batch operations should safely return 0 for null arrays
-    assert(os.startTasks(nullptr, 5) == 0);
-    assert(os.stopTasks(nullptr, 5) == 0);
-    assert(os.pauseTasks(nullptr, 5) == 0);
-    assert(os.resumeTasks(nullptr, 5) == 0);
+    // Set a prior error to verify no-op clears it
+    os.startTask(99);  // Invalid ID sets error
+    assert(os.getError() == ArdaError::InvalidId);
 
-    // Also test zero/negative count
+    // All batch operations should safely return 0 for null arrays AND clear error
+    assert(os.startTasks(nullptr, 5) == 0);
+    assert(os.getError() == ArdaError::Ok);
+
+    os.startTask(99);  // Set error again
+    assert(os.stopTasks(nullptr, 5) == 0);
+    assert(os.getError() == ArdaError::Ok);
+
+    os.startTask(99);
+    assert(os.pauseTasks(nullptr, 5) == 0);
+    assert(os.getError() == ArdaError::Ok);
+
+    os.startTask(99);
+    assert(os.resumeTasks(nullptr, 5) == 0);
+    assert(os.getError() == ArdaError::Ok);
+
+    // Also test zero/negative count clears error
     int8_t ids[] = {0, 1, 2};
+    os.startTask(99);
     assert(os.startTasks(ids, 0) == 0);
+    assert(os.getError() == ArdaError::Ok);
+
+    os.startTask(99);
     assert(os.startTasks(ids, -1) == 0);
+    assert(os.getError() == ArdaError::Ok);
 
     printf("PASSED\n");
 }
@@ -2765,6 +2946,64 @@ void test_stopTasks_counts_partial_success() {
         assert(OS.getTaskState(ids[i]) == TaskState::Stopped);
     }
 
+    printf("PASSED\n");
+}
+
+void test_stopTasks_preserves_teardown_error() {
+    printf("Test: stopTasks preserves teardown error... ");
+    resetTestCounters();
+    trdwnSelfRestartCalled = false;
+
+    // Create a normal task and a task whose teardown restarts itself
+    int8_t normalId = OS.createTask("normal", task1_setup, task1_loop, 0);
+    trdwnSelfRestartTaskId = OS.createTask("restart", trdwnSelfRestart_setup,
+                                           trdwnSelfRestart_loop, 0,
+                                           trdwnSelfRestart_trdwn);
+    assert(normalId >= 0 && trdwnSelfRestartTaskId >= 0);
+
+    OS.begin();
+
+    // Stop both tasks - the restart task will have TeardownChangedState
+    int8_t ids[] = {normalId, trdwnSelfRestartTaskId};
+    int8_t failedId = -1;
+    int8_t stopped = OS.stopTasks(ids, 2, &failedId);
+
+    // Only normal task should be counted as stopped.
+    // TeardownChangedState means the task restarted itself - it's NOT actually stopped!
+    assert(stopped == 1);
+    assert(failedId == trdwnSelfRestartTaskId);
+
+    // Error should be StateChanged from the teardown that restarted
+    assert(OS.getError() == ArdaError::StateChanged);
+
+    printf("PASSED\n");
+}
+
+void test_stopAllTasks_preserves_teardown_error() {
+    printf("Test: stopAllTasks preserves teardown error... ");
+    resetTestCounters();
+    trdwnSelfRestartCalled = false;
+
+    // Create a normal task and a task whose teardown restarts itself
+    int8_t normalId = OS.createTask("normal", task1_setup, task1_loop, 0);
+    trdwnSelfRestartTaskId = OS.createTask("restart", trdwnSelfRestart_setup,
+                                           trdwnSelfRestart_loop, 0,
+                                           trdwnSelfRestart_trdwn);
+    assert(normalId >= 0 && trdwnSelfRestartTaskId >= 0);
+
+    OS.begin();
+
+    // Stop all tasks
+    int8_t stopped = OS.stopAllTasks();
+
+    // Only normal task should be counted as stopped.
+    // TeardownChangedState means the task restarted itself - it's NOT actually stopped!
+    assert(stopped == 1);
+
+    // Error should be StateChanged from the teardown that restarted
+    assert(OS.getError() == ArdaError::StateChanged);
+
+    (void)normalId;  // Used only to balance the count
     printf("PASSED\n");
 }
 
@@ -2911,8 +3150,8 @@ void test_start_task_run_immediately() {
     resetTestCounters();
 
     Arda os;
-    int8_t id = os.createTask("task", task1_setup, task1_loop, 1000);  // 1 second interval
-    os.begin(false);  // Initialize without auto-starting
+    int8_t id = os.createTask("task", task1_setup, task1_loop, 1000, nullptr, false);  // 1 second interval
+    os.begin();  // Initialize (task has autoStart=false)
 
     // Normal start - should NOT run on first run() cycle
     os.startTask(id);
@@ -2930,13 +3169,68 @@ void test_start_task_run_immediately() {
     printf("PASSED\n");
 }
 
+// For mid-cycle start test
+static int midCycleStarterRuns = 0;
+static int midCycleStartedRuns = 0;
+static int8_t midCycleStartedId = -1;
+static Arda* midCycleTestOs = nullptr;
+
+void midCycleStarter_setup() {}
+void midCycleStarter_loop() {
+    midCycleStarterRuns++;
+    if (midCycleStarterRuns == 1 && midCycleStartedId >= 0 && midCycleTestOs) {
+        // Start the other task mid-cycle with runImmediately=false
+        midCycleTestOs->startTask(midCycleStartedId, false);
+    }
+}
+
+void midCycleStarted_setup() {}
+void midCycleStarted_loop() {
+    midCycleStartedRuns++;
+}
+
+void test_mid_cycle_start_no_immediate_run() {
+    printf("Test: task started mid-cycle with runImmediately=false waits... ");
+    midCycleStarterRuns = 0;
+    midCycleStartedRuns = 0;
+
+    Arda os;
+    midCycleTestOs = &os;
+
+    // Create starter task (interval=0 so it runs every cycle) with autoStart=false
+    int8_t starterId = os.createTask("starter", midCycleStarter_setup, midCycleStarter_loop, 0, nullptr, false);
+
+    // Create started task (will be started mid-cycle by starter) with autoStart=false
+    midCycleStartedId = os.createTask("started", midCycleStarted_setup, midCycleStarted_loop, 0, nullptr, false);
+
+    // Initialize scheduler, then manually start only the starter
+    os.begin();
+    os.startTask(starterId, true);  // Start starter with runImmediately=true
+
+    // First run: starter runs and starts "started" mid-cycle with runImmediately=false
+    // "started" should NOT run this cycle despite interval=0
+    setMockMillis(0);
+    os.run();
+    assert(midCycleStarterRuns == 1);
+    assert(midCycleStartedRuns == 0);  // Did NOT run this cycle (ranThisCycle=true)
+
+    // Second run: now "started" should run
+    setMockMillis(1);
+    os.run();
+    assert(midCycleStarterRuns == 2);
+    assert(midCycleStartedRuns == 1);  // Now it ran
+
+    midCycleTestOs = nullptr;
+    printf("PASSED\n");
+}
+
 void test_set_task_interval_no_reset() {
     printf("Test: setTaskInterval with resetTiming=false... ");
     resetTestCounters();
 
     Arda os;
-    int8_t id = os.createTask("task", task1_setup, task1_loop, 100);
-    os.begin(false);  // Initialize without auto-starting
+    int8_t id = os.createTask("task", task1_setup, task1_loop, 100, nullptr, false);
+    os.begin();  // Initialize (task has autoStart=false)
     os.startTask(id, true);  // Start with immediate run
 
     setMockMillis(0);
@@ -2948,7 +3242,7 @@ void test_set_task_interval_no_reset() {
     os.run();
     assert(loop1Called == 1);
 
-    // Change interval to 200ms WITH resetTiming=true (default)
+    // Change interval to 200ms WITH resetTiming=true
     // This resets lastRun to now (50), so next run at 250
     os.setTaskInterval(id, 200, true);
     setMockMillis(100);
@@ -3149,62 +3443,6 @@ void test_task_modifies_own_interval() {
     printf("PASSED\n");
 }
 
-static int8_t taskToDelete = -1;
-static bool deleteAttempted = false;
-static StopResult stopYieldedResult = StopResult::Failed;
-static ArdaError stopYieldedError = ArdaError::Ok;
-static bool deleteSucceeded = false;
-
-void deleterTask_setup() {}
-void deleterTask_loop() {
-    loop1Called++;
-    // Try to delete the other task while yielding
-    OS.yield();
-}
-
-void victimTask_setup() {}
-void victimTask_loop() {
-    loop2Called++;
-    if (taskToDelete >= 0 && !deleteAttempted) {
-        deleteAttempted = true;
-        stopYieldedResult = OS.stopTask(taskToDelete);
-        stopYieldedError = OS.getError();  // Capture error before deleteTask overwrites it
-        deleteSucceeded = OS.deleteTask(taskToDelete);
-    }
-}
-
-void test_delete_other_task_during_yield() {
-    printf("Test: delete other task during yield... ");
-    resetTestCounters();
-    deleteAttempted = false;
-    stopYieldedResult = StopResult::Failed;
-    stopYieldedError = ArdaError::Ok;
-    deleteSucceeded = false;
-
-    // Create deleter first (id=0), victim second (id=1)
-    int8_t deleterId = OS.createTask("deleter", deleterTask_setup, deleterTask_loop, 0);
-    (void)OS.createTask("victim", victimTask_setup, victimTask_loop, 0);
-    taskToDelete = deleterId;  // Victim will try to delete deleter
-
-    OS.begin();
-    OS.run();
-
-    // Deleter runs first, calls yield(), victim runs and tries to stop+delete deleter
-    // Deleter is in yield (inYield=true), so stop should fail (can't run trdwn mid-yield)
-    assert(deleteAttempted == true);
-    assert(stopYieldedResult == StopResult::Failed);
-    assert(stopYieldedError == ArdaError::TaskYielded);
-    // Delete also fails because task is still running (stop failed)
-    assert(deleteSucceeded == false);
-    assert(OS.isValidTask(deleterId) == true);  // Still exists
-    assert(OS.getTaskState(deleterId) == TaskState::Running);  // Still running
-
-    // Clean up
-    taskToDelete = -1;
-
-    printf("PASSED\n");
-}
-
 void test_double_delete() {
     printf("Test: double delete attempt... ");
     resetTestCounters();
@@ -3222,35 +3460,6 @@ void test_double_delete() {
     // Task should remain invalid
     assert(os.isValidTask(id) == false);
     assert(os.getTaskState(id) == TaskState::Invalid);
-
-    printf("PASSED\n");
-}
-
-static int traceYieldCount = 0;
-void traceWithYield(int8_t taskId, TraceEvent event) {
-    (void)taskId;
-    if (event == TraceEvent::TaskLoopBegin) {
-        traceYieldCount++;
-        // This is questionable behavior but should not crash
-        OS.yield();
-    }
-}
-
-void test_yield_from_trace_callback() {
-    printf("Test: yield from trace callback... ");
-    resetTestCounters();
-    traceYieldCount = 0;
-
-    OS.setTraceCallback(traceWithYield);
-    OS.createTask("t1", task1_setup, task1_loop, 0);
-    OS.createTask("t2", task2_setup, task2_loop, 0);
-    OS.begin();
-
-    // Should not crash or infinite loop due to reentrancy guards
-    OS.run();
-
-    assert(traceYieldCount >= 1);  // Callback was invoked
-    OS.setTraceCallback(nullptr);  // Clean up
 
     printf("PASSED\n");
 }
@@ -3313,6 +3522,34 @@ void test_run_before_begin() {
     printf("PASSED\n");
 }
 
+void test_run_reentrancy_detected() {
+    printf("Test: run() reentrancy returns false... ");
+    resetTestCounters();
+
+    // Test that calling run() from within a task loop is detected and fails
+    static bool reentrantRunAttempted = false;
+    static bool reentrantRunResult = true;
+    static ArdaError reentrantRunError = ArdaError::Ok;
+
+    auto reentrantLoop = []() {
+        if (!reentrantRunAttempted) {
+            reentrantRunAttempted = true;
+            reentrantRunResult = OS.run();  // Try to call run() while already in run()
+            reentrantRunError = OS.getError();
+        }
+    };
+
+    OS.createTask("reenter", nullptr, reentrantLoop, 0);
+    OS.begin();
+    OS.run();  // This will execute reentrantLoop which tries to call run() again
+
+    assert(reentrantRunAttempted == true);
+    assert(reentrantRunResult == false);  // Reentrant call should fail
+    assert(reentrantRunError == ArdaError::InCallback);
+
+    printf("PASSED\n");
+}
+
 void test_get_slot_count() {
     printf("Test: getSlotCount vs getTaskCount... ");
     resetTestCounters();
@@ -3342,9 +3579,9 @@ void test_batch_failed_id() {
     resetTestCounters();
 
     Arda os;
-    int8_t id1 = os.createTask("t1", task1_setup, task1_loop, 0);
-    int8_t id2 = os.createTask("t2", task2_setup, task2_loop, 0);
-    os.begin(false);
+    int8_t id1 = os.createTask("t1", task1_setup, task1_loop, 0, nullptr, false);
+    int8_t id2 = os.createTask("t2", task2_setup, task2_loop, 0, nullptr, false);
+    os.begin();
 
     // Start both - should succeed
     int8_t ids[] = {id1, id2};
@@ -3520,49 +3757,6 @@ void test_renameTask_on_deleted() {
     printf("PASSED\n");
 }
 
-// For pause during yield test
-static int8_t pauseDuringYieldTaskId = -1;
-static bool pauseDuringYieldAttempted = false;
-static bool pauseDuringYieldResult = false;
-static int pauseDuringYieldTaskARuns = 0;
-
-void pauseDuringYieldTaskA_setup() {}
-void pauseDuringYieldTaskA_loop() {
-    pauseDuringYieldTaskARuns++;
-    OS.yield();  // Task B will try to pause us during this yield
-}
-
-void pauseDuringYieldTaskB_setup() {}
-void pauseDuringYieldTaskB_loop() {
-    if (!pauseDuringYieldAttempted && pauseDuringYieldTaskId >= 0) {
-        pauseDuringYieldAttempted = true;
-        pauseDuringYieldResult = OS.pauseTask(pauseDuringYieldTaskId);
-    }
-}
-
-void test_pause_task_during_yield() {
-    printf("Test: pause task during its yield... ");
-    resetTestCounters();
-    pauseDuringYieldTaskId = -1;
-    pauseDuringYieldAttempted = false;
-    pauseDuringYieldResult = false;
-    pauseDuringYieldTaskARuns = 0;
-
-    pauseDuringYieldTaskId = OS.createTask("yieldA", pauseDuringYieldTaskA_setup, pauseDuringYieldTaskA_loop, 0);
-    OS.createTask("pauseB", pauseDuringYieldTaskB_setup, pauseDuringYieldTaskB_loop, 0);
-    OS.begin();
-
-    // Run one cycle - task A yields, task B tries to pause task A
-    OS.run();
-
-    assert(pauseDuringYieldAttempted == true);
-    // Pausing a yielded task should succeed (it's still Running state)
-    assert(pauseDuringYieldResult == true);
-    assert(OS.getTaskState(pauseDuringYieldTaskId) == TaskState::Paused);
-
-    printf("PASSED\n");
-}
-
 void test_pauseAllTasks_with_mixed_states() {
     printf("Test: pauseAllTasks with some already paused... ");
     resetTestCounters();
@@ -3646,6 +3840,180 @@ void test_stopAllTasks_with_some_stopped() {
     printf("PASSED\n");
 }
 
+// ============================================================================
+// Batch Operation Snapshot Safety Tests
+// ============================================================================
+
+// Callback that creates a new task during startAllTasks
+static int8_t createdInSetup = -1;
+static Arda* setupCreatorScheduler = nullptr;
+void setupCreatesTask_setup() {
+    setup1Called++;
+    if (setupCreatorScheduler) {
+        createdInSetup = setupCreatorScheduler->createTask("created", nullptr, task1_loop, 0, nullptr, false);
+    }
+}
+void setupCreatesTask_loop() { loop1Called++; }
+
+void test_startAllTasks_snapshot_safety() {
+    printf("Test: startAllTasks snapshot protects against setup creating task... ");
+    resetTestCounters();
+
+    Arda os;
+    setupCreatorScheduler = &os;
+    createdInSetup = -1;
+
+    // Create two tasks - one will create another in its setup
+    os.createTask("t1", setupCreatesTask_setup, setupCreatesTask_loop, 0);
+    os.createTask("t2", task1_setup, task1_loop, 0);
+
+    assert(os.getTaskCount() == 2);
+
+    // startAllTasks should start only the tasks that existed at snapshot time
+    int8_t started = os.startAllTasks();
+
+    // Two tasks started (the original two)
+    // The task created during setup should NOT be counted in started
+    assert(started == 2);
+    assert(setup1Called == 2);  // Both original setups ran
+
+    // The new task was created but NOT started (wasn't in snapshot)
+    assert(createdInSetup >= 0);  // Task was created
+    assert(os.isValidTask(createdInSetup));
+    assert(os.getTaskState(createdInSetup) == TaskState::Stopped);  // Not started by startAllTasks
+
+    // Total task count is now 3
+    assert(os.getTaskCount() == 3);
+
+    setupCreatorScheduler = nullptr;
+    printf("PASSED\n");
+}
+
+// Callback that deletes another task during stopAllTasks
+static int8_t taskToDeleteInTeardown = -1;
+static Arda* teardownDeleterScheduler = nullptr;
+void teardownDeletesTask_setup() { setup1Called++; }
+void teardownDeletesTask_loop() { loop1Called++; }
+void teardownDeletesTask_teardown() {
+    trdwnCalled++;
+    if (teardownDeleterScheduler && taskToDeleteInTeardown >= 0) {
+        // Stop and delete the other task
+        teardownDeleterScheduler->stopTask(taskToDeleteInTeardown);
+        teardownDeleterScheduler->deleteTask(taskToDeleteInTeardown);
+        taskToDeleteInTeardown = -1;  // Only delete once
+    }
+}
+
+void test_stopAllTasks_snapshot_safety() {
+    printf("Test: stopAllTasks snapshot protects against teardown deleting task... ");
+    resetTestCounters();
+
+    Arda os;
+    teardownDeleterScheduler = &os;
+    trdwnCalled = 0;
+
+    // Create two tasks - one will delete the other in its teardown
+    // Use trdwnTask_trdwn for victim which also increments trdwnCalled
+    int8_t id1 = os.createTask("deleter", teardownDeletesTask_setup, teardownDeletesTask_loop, 0, teardownDeletesTask_teardown);
+    int8_t id2 = os.createTask("victim", task1_setup, task1_loop, 0, trdwnTask_trdwn);
+
+    taskToDeleteInTeardown = id2;  // Tell id1's teardown to delete id2
+
+    os.begin();
+    assert(os.getTaskCount() == 2);
+    assert(os.getTaskState(id1) == TaskState::Running);
+    assert(os.getTaskState(id2) == TaskState::Running);
+
+    // stopAllTasks should complete without crash even though teardown deletes a task
+    int8_t stopped = os.stopAllTasks();
+
+    // Flow analysis:
+    // 1. Snapshot: [id1, id2] both Running
+    // 2. Stop id1: runs teardownDeletesTask_teardown (trdwnCalled=1)
+    //    - which calls stopTask(id2): runs trdwnTask_trdwn (trdwnCalled=2)
+    //    - then deletes id2
+    // 3. Try to stop id2: invalid (deleted), skipped
+    // Both teardowns ran: deleter's directly, victim's from nested stopTask call
+    assert(trdwnCalled == 2);
+
+    // stopped count: id1 was stopped by stopAllTasks, id2 was stopped by nested call
+    // but id2 was invalid when stopAllTasks tried to process it, so only 1 counted
+    assert(stopped == 1);
+
+    // Only deleter should remain (victim was deleted)
+    assert(os.getTaskCount() == 1);
+    assert(os.isValidTask(id1));
+    assert(!os.isValidTask(id2));
+
+    teardownDeleterScheduler = nullptr;
+    printf("PASSED\n");
+}
+
+// Test pauseAllTasks with callback that modifies state
+static Arda* pauseModifierScheduler = nullptr;
+static int8_t taskToModifyInPause = -1;
+void pauseModifier_setup() { setup1Called++; }
+void pauseModifier_loop() {
+    loop1Called++;
+    // This task will pause another task when it runs
+    if (pauseModifierScheduler && taskToModifyInPause >= 0) {
+        // Stop the other task (changing its state from Running to Stopped)
+        pauseModifierScheduler->stopTask(taskToModifyInPause);
+        taskToModifyInPause = -1;
+    }
+}
+
+void test_pauseAllTasks_snapshot_safety() {
+    printf("Test: pauseAllTasks handles state changes during iteration... ");
+    resetTestCounters();
+
+    Arda os;
+    pauseModifierScheduler = &os;
+
+    int8_t id1 = os.createTask("t1", task1_setup, task1_loop, 0);
+    int8_t id2 = os.createTask("t2", task2_setup, task2_loop, 0);
+
+    os.begin();
+    assert(os.getTaskState(id1) == TaskState::Running);
+    assert(os.getTaskState(id2) == TaskState::Running);
+
+    // Simulate that between snapshot and pause, task id2 gets stopped by some other means
+    // We can't easily do this with callbacks for pause (no callback on pause)
+    // So just test basic snapshot behavior
+
+    // pauseAllTasks should work
+    int8_t paused = os.pauseAllTasks();
+    assert(paused == 2);
+    assert(os.getTaskState(id1) == TaskState::Paused);
+    assert(os.getTaskState(id2) == TaskState::Paused);
+
+    pauseModifierScheduler = nullptr;
+    printf("PASSED\n");
+}
+
+void test_resumeAllTasks_snapshot_safety() {
+    printf("Test: resumeAllTasks handles state changes during iteration... ");
+    resetTestCounters();
+
+    Arda os;
+    int8_t id1 = os.createTask("t1", task1_setup, task1_loop, 0);
+    int8_t id2 = os.createTask("t2", task2_setup, task2_loop, 0);
+
+    os.begin();
+    os.pauseTask(id1);
+    os.pauseTask(id2);
+    assert(os.getTaskState(id1) == TaskState::Paused);
+    assert(os.getTaskState(id2) == TaskState::Paused);
+
+    // resumeAllTasks should work
+    int8_t resumed = os.resumeAllTasks();
+    assert(resumed == 2);
+    assert(os.getTaskState(id1) == TaskState::Running);
+    assert(os.getTaskState(id2) == TaskState::Running);
+
+    printf("PASSED\n");
+}
+
 // For REGISTER_TASK_ON macro test - need a local scheduler
 TASK_SETUP(onMacT) { setup1Called++; }
 TASK_LOOP(onMacT) { loop1Called++; }
@@ -3675,35 +4043,6 @@ void test_register_task_on_macros() {
     REGISTER_TASK_ID_ON(taskId2, localOs, onMacT, 200);  // Note: duplicate name will fail
     // This will fail because "onMacT" already exists
     assert(taskId2 == -1);
-
-    printf("PASSED\n");
-}
-
-// For consecutive yield test
-static int consecutiveYieldRuns = 0;
-
-void consecutiveYieldTask_setup() {}
-void consecutiveYieldTask_loop() {
-    consecutiveYieldRuns++;
-    OS.yield();
-    OS.yield();  // Second consecutive yield
-    OS.yield();  // Third consecutive yield
-}
-
-void test_consecutive_yield_calls() {
-    printf("Test: consecutive yield() calls... ");
-    resetTestCounters();
-    consecutiveYieldRuns = 0;
-
-    OS.createTask("mltYld", consecutiveYieldTask_setup, consecutiveYieldTask_loop, 0);
-    OS.createTask("other", task1_setup, task1_loop, 0);
-    OS.begin();
-
-    // Should not crash or cause issues
-    OS.run();
-
-    assert(consecutiveYieldRuns == 1);  // Task ran once despite multiple yields
-    assert(loop1Called == 1);  // Other task also ran once
 
     printf("PASSED\n");
 }
@@ -3999,12 +4338,12 @@ void traceDepthCallback(int8_t taskId, TraceEvent event) {
         // Create a task that will be started, adding to callback depth
         int8_t newId = OS.createTask("nested", task1_setup, task1_loop, 0, nullptr, false);
         if (newId >= 0) {
-            bool started = OS.startTask(newId);
-            if (!started && OS.getError() == ArdaError::CallbackDepth) {
+            StartResult started = OS.startTask(newId);
+            if (started == StartResult::Failed && OS.getError() == ArdaError::CallbackDepth) {
                 traceDepthStartFailed = true;
             }
             // Clean up
-            if (started) {
+            if (started == StartResult::Success) {
                 OS.stopTask(newId);
             }
             OS.deleteTask(newId);
@@ -4070,6 +4409,30 @@ void test_loop_self_stop() {
     loopSelfStopCalled = false;
     OS.run();
     assert(loopSelfStopCalled == false);
+
+    printf("PASSED\n");
+}
+
+void test_self_stop_increments_runcount() {
+    printf("Test: self-stop still increments runCount and lastRun... ");
+    resetTestCounters();
+    loopSelfStopCalled = false;
+
+    loopSelfStopTaskId = OS.createTask("slStop", loopSelfStop_setup, loopSelfStop_loop, 0);
+    OS.begin();
+
+    // Verify runCount is 0 before running
+    assert(OS.getTaskRunCount(loopSelfStopTaskId) == 0);
+    assert(OS.getTaskLastRun(loopSelfStopTaskId) == 0);
+
+    _mockMillis = 100;
+    OS.run();  // Task runs and stops itself
+
+    assert(loopSelfStopCalled == true);
+    assert(OS.getTaskState(loopSelfStopTaskId) == TaskState::Stopped);
+    // Even though task stopped itself, it DID run - runCount should be 1
+    assert(OS.getTaskRunCount(loopSelfStopTaskId) == 1);
+    assert(OS.getTaskLastRun(loopSelfStopTaskId) == 100);
 
     printf("PASSED\n");
 }
@@ -4293,14 +4656,14 @@ void test_resumeAllTasks_with_mixed_states() {
 #ifndef ARDA_NO_PRIORITY
 
 void test_priority_default() {
-    printf("Test: new tasks have default priority 8... ");
+    printf("Test: new tasks have default priority Normal... ");
     resetTestCounters();
 
     Arda os;
     int8_t id = os.createTask("task", task1_setup, task1_loop, 0);
 
-    assert(os.getTaskPriority(id) == ARDA_DEFAULT_PRIORITY);
-    assert(os.getTaskPriority(id) == 8);
+    assert(os.getTaskPriority(id) == TaskPriority::Normal);
+    assert(static_cast<uint8_t>(os.getTaskPriority(id)) == ARDA_DEFAULT_PRIORITY);
 
     printf("PASSED\n");
 }
@@ -4312,22 +4675,21 @@ void test_priority_set_get() {
     Arda os;
     int8_t id = os.createTask("task", task1_setup, task1_loop, 0);
 
-    // Set to various values
-    assert(os.setTaskPriority(id, 0) == true);
-    assert(os.getTaskPriority(id) == 0);
+    // Test all five priority levels
+    assert(os.setTaskPriority(id, TaskPriority::Lowest) == true);
+    assert(os.getTaskPriority(id) == TaskPriority::Lowest);
 
-    assert(os.setTaskPriority(id, 15) == true);
-    assert(os.getTaskPriority(id) == 15);
+    assert(os.setTaskPriority(id, TaskPriority::Low) == true);
+    assert(os.getTaskPriority(id) == TaskPriority::Low);
 
-    assert(os.setTaskPriority(id, 7) == true);
-    assert(os.getTaskPriority(id) == 7);
+    assert(os.setTaskPriority(id, TaskPriority::Normal) == true);
+    assert(os.getTaskPriority(id) == TaskPriority::Normal);
 
-    // Use enum values
-    assert(os.setTaskPriority(id, static_cast<uint8_t>(TaskPriority::Lowest)) == true);
-    assert(os.getTaskPriority(id) == static_cast<uint8_t>(TaskPriority::Lowest));
+    assert(os.setTaskPriority(id, TaskPriority::High) == true);
+    assert(os.getTaskPriority(id) == TaskPriority::High);
 
-    assert(os.setTaskPriority(id, static_cast<uint8_t>(TaskPriority::Highest)) == true);
-    assert(os.getTaskPriority(id) == static_cast<uint8_t>(TaskPriority::Highest));
+    assert(os.setTaskPriority(id, TaskPriority::Highest) == true);
+    assert(os.getTaskPriority(id) == TaskPriority::Highest);
 
     printf("PASSED\n");
 }
@@ -4338,18 +4700,18 @@ void test_priority_create_with_priority() {
 
     Arda os;
 
-    // Create with explicit priority
-    int8_t id1 = os.createTask("high", task1_setup, task1_loop, 0, 15, nullptr, false);
-    int8_t id2 = os.createTask("low", task2_setup, task2_loop, 0, 0, nullptr, false);
-    int8_t id3 = os.createTask("mid", task1_setup, task1_loop, 0, 8, nullptr, false);
+    // Create with explicit priority (priority is last parameter)
+    int8_t id1 = os.createTask("high", task1_setup, task1_loop, 0, nullptr, false, TaskPriority::Highest);
+    int8_t id2 = os.createTask("low", task2_setup, task2_loop, 0, nullptr, false, TaskPriority::Lowest);
+    int8_t id3 = os.createTask("mid", task1_setup, task1_loop, 0, nullptr, false, TaskPriority::Normal);
 
     assert(id1 >= 0);
     assert(id2 >= 0);
     assert(id3 >= 0);
 
-    assert(os.getTaskPriority(id1) == 15);
-    assert(os.getTaskPriority(id2) == 0);
-    assert(os.getTaskPriority(id3) == 8);
+    assert(os.getTaskPriority(id1) == TaskPriority::Highest);
+    assert(os.getTaskPriority(id2) == TaskPriority::Lowest);
+    assert(os.getTaskPriority(id3) == TaskPriority::Normal);
 
     printf("PASSED\n");
 }
@@ -4361,45 +4723,52 @@ void test_priority_invalid_task() {
     Arda os;
 
     // setTaskPriority on invalid ID should fail
-    assert(os.setTaskPriority(-1, 5) == false);
+    assert(os.setTaskPriority(-1, TaskPriority::High) == false);
     assert(os.getError() == ArdaError::InvalidId);
 
-    assert(os.setTaskPriority(99, 5) == false);
+    assert(os.setTaskPriority(99, TaskPriority::High) == false);
     assert(os.getError() == ArdaError::InvalidId);
 
-    // getTaskPriority on invalid ID should return 0
-    assert(os.getTaskPriority(-1) == 0);
-    assert(os.getTaskPriority(99) == 0);
+    // getTaskPriority on invalid ID should return Lowest
+    assert(os.getTaskPriority(-1) == TaskPriority::Lowest);
+    assert(os.getTaskPriority(99) == TaskPriority::Lowest);
 
     // Create and delete a task
     int8_t id = os.createTask("task", task1_setup, task1_loop, 0);
     os.deleteTask(id);
 
     // Operations on deleted task
-    assert(os.setTaskPriority(id, 5) == false);
+    assert(os.setTaskPriority(id, TaskPriority::High) == false);
     assert(os.getError() == ArdaError::InvalidId);
-    assert(os.getTaskPriority(id) == 0);
+    assert(os.getTaskPriority(id) == TaskPriority::Lowest);
 
     printf("PASSED\n");
 }
 
-void test_priority_clamp() {
-    printf("Test: priority values > 15 are clamped... ");
+void test_priority_rejected_if_invalid() {
+    printf("Test: priority values > Highest are rejected... ");
     resetTestCounters();
 
     Arda os;
     int8_t id = os.createTask("task", task1_setup, task1_loop, 0);
 
-    // Set to value > 15
-    assert(os.setTaskPriority(id, 20) == true);
-    assert(os.getTaskPriority(id) == 15);  // Clamped to 15
+    // Set valid priority first
+    assert(os.setTaskPriority(id, TaskPriority::High) == true);
+    assert(os.getTaskPriority(id) == TaskPriority::High);
 
-    assert(os.setTaskPriority(id, 255) == true);
-    assert(os.getTaskPriority(id) == 15);  // Clamped to 15
+    // setTaskPriority rejects values > Highest with InvalidValue
+    assert(os.setTaskPriority(id, static_cast<TaskPriority>(10)) == false);
+    assert(os.getError() == ArdaError::InvalidValue);
+    assert(os.getTaskPriority(id) == TaskPriority::High);  // Unchanged
 
-    // Create with priority > 15
-    int8_t id2 = os.createTask("task2", task1_setup, task1_loop, 0, 100, nullptr, false);
-    assert(os.getTaskPriority(id2) == 15);  // Clamped to 15
+    assert(os.setTaskPriority(id, static_cast<TaskPriority>(255)) == false);
+    assert(os.getError() == ArdaError::InvalidValue);
+    assert(os.getTaskPriority(id) == TaskPriority::High);  // Unchanged
+
+    // createTask with priority > Highest should also fail
+    int8_t id2 = os.createTask("task2", task1_setup, task1_loop, 0, nullptr, false, static_cast<TaskPriority>(100));
+    assert(id2 == -1);
+    assert(os.getError() == ArdaError::InvalidValue);
 
     printf("PASSED\n");
 }
@@ -4439,11 +4808,11 @@ void test_priority_ordering() {
 
     // Create tasks in reverse priority order (low first, high last)
     // to ensure it's priority, not creation order, that matters
-    int8_t idLow = OS.createTask("low", priorityOrderLow_setup, priorityOrderLow_loop, 0, 2, nullptr, false);
-    int8_t idMid = OS.createTask("mid", priorityOrderMid_setup, priorityOrderMid_loop, 0, 8, nullptr, false);
-    int8_t idHigh = OS.createTask("high", priorityOrderHigh_setup, priorityOrderHigh_loop, 0, 15, nullptr, false);
+    int8_t idLow = OS.createTask("low", priorityOrderLow_setup, priorityOrderLow_loop, 0, nullptr, false, TaskPriority::Low);
+    int8_t idMid = OS.createTask("mid", priorityOrderMid_setup, priorityOrderMid_loop, 0, nullptr, false, TaskPriority::Normal);
+    int8_t idHigh = OS.createTask("high", priorityOrderHigh_setup, priorityOrderHigh_loop, 0, nullptr, false, TaskPriority::Highest);
 
-    OS.begin(false);
+    OS.begin();  // Tasks have autoStart=false
     OS.startTask(idLow);
     OS.startTask(idMid);
     OS.startTask(idHigh);
@@ -4494,12 +4863,12 @@ void test_priority_same_level() {
     samePriorityOrder[1] = -1;
     samePriorityOrder[2] = -1;
 
-    // All tasks have the same priority
-    (void)OS.createTask("t0", samePriorityTask0_setup, samePriorityTask0_loop, 0, 8, nullptr, true);
-    (void)OS.createTask("t1", samePriorityTask1_setup, samePriorityTask1_loop, 0, 8, nullptr, true);
-    (void)OS.createTask("t2", samePriorityTask2_setup, samePriorityTask2_loop, 0, 8, nullptr, true);
+    // All tasks have the same priority, created with autoStart=false
+    (void)OS.createTask("t0", samePriorityTask0_setup, samePriorityTask0_loop, 0, nullptr, false, TaskPriority::Normal);
+    (void)OS.createTask("t1", samePriorityTask1_setup, samePriorityTask1_loop, 0, nullptr, false, TaskPriority::Normal);
+    (void)OS.createTask("t2", samePriorityTask2_setup, samePriorityTask2_loop, 0, nullptr, false, TaskPriority::Normal);
 
-    OS.begin(false);
+    OS.begin();
     OS.startAllTasks();
 
     OS.run();
@@ -4539,10 +4908,10 @@ void test_priority_with_intervals() {
 
     // High priority but long interval (1000ms)
     // Low priority but short interval (100ms)
-    int8_t idHigh = OS.createTask("high", priorityIntervalHigh_setup, priorityIntervalHigh_loop, 1000, 15, nullptr, false);
-    int8_t idLow = OS.createTask("low", priorityIntervalLow_setup, priorityIntervalLow_loop, 100, 2, nullptr, false);
+    int8_t idHigh = OS.createTask("high", priorityIntervalHigh_setup, priorityIntervalHigh_loop, 1000, nullptr, false, TaskPriority::Highest);
+    int8_t idLow = OS.createTask("low", priorityIntervalLow_setup, priorityIntervalLow_loop, 100, nullptr, false, TaskPriority::Low);
 
-    OS.begin(false);
+    OS.begin();  // Tasks have autoStart=false
     OS.startTask(idHigh, true);  // Run immediately
     OS.startTask(idLow, true);   // Run immediately
 
@@ -4575,12 +4944,12 @@ void test_priority_with_intervals() {
 void test_priority_enum_values() {
     printf("Test: TaskPriority enum values... ");
 
-    // Verify enum values match documentation
+    // Verify enum values are consecutive 0-4
     assert(static_cast<uint8_t>(TaskPriority::Lowest) == 0);
-    assert(static_cast<uint8_t>(TaskPriority::Low) == 4);
-    assert(static_cast<uint8_t>(TaskPriority::Normal) == 8);
-    assert(static_cast<uint8_t>(TaskPriority::High) == 12);
-    assert(static_cast<uint8_t>(TaskPriority::Highest) == 15);
+    assert(static_cast<uint8_t>(TaskPriority::Low) == 1);
+    assert(static_cast<uint8_t>(TaskPriority::Normal) == 2);
+    assert(static_cast<uint8_t>(TaskPriority::High) == 3);
+    assert(static_cast<uint8_t>(TaskPriority::Highest) == 4);
 
     // Verify ARDA_DEFAULT_PRIORITY matches TaskPriority::Normal
     assert(ARDA_DEFAULT_PRIORITY == static_cast<uint8_t>(TaskPriority::Normal));
@@ -4595,24 +4964,24 @@ void test_priority_preserved_across_stop_start() {
     Arda os;
     int8_t id = os.createTask("task", task1_setup, task1_loop, 0);
 
-    os.setTaskPriority(id, 12);
-    assert(os.getTaskPriority(id) == 12);
+    os.setTaskPriority(id, TaskPriority::High);
+    assert(os.getTaskPriority(id) == TaskPriority::High);
 
     os.startTask(id);
-    assert(os.getTaskPriority(id) == 12);
+    assert(os.getTaskPriority(id) == TaskPriority::High);
 
     os.stopTask(id);
-    assert(os.getTaskPriority(id) == 12);
+    assert(os.getTaskPriority(id) == TaskPriority::High);
 
     os.startTask(id);
-    assert(os.getTaskPriority(id) == 12);
+    assert(os.getTaskPriority(id) == TaskPriority::High);
 
     printf("PASSED\n");
 }
 
 // Regression test: priority must be set BEFORE setup() runs when using
 // createTask with explicit priority and autoStart=true
-static uint8_t capturedPriorityInSetup = 255;
+static TaskPriority capturedPriorityInSetup = TaskPriority::Lowest;
 
 void prioritySetupCapture_setup() {
     // Capture our own priority during setup using getCurrentTask()
@@ -4626,24 +4995,24 @@ void prioritySetupCapture_loop() {}
 void test_priority_set_before_setup_runs() {
     printf("Test: priority set before setup() runs... ");
     resetTestCounters();
-    capturedPriorityInSetup = 255;
+    capturedPriorityInSetup = TaskPriority::Lowest;
 
-    OS.begin(false);  // Initialize scheduler without auto-start
+    OS.begin();  // Initialize scheduler
 
-    // Create task with explicit priority=15 and autoStart=true
-    // The priority should be 15 when setup() runs, not default 8
+    // Create task with explicit priority=Highest and autoStart=true
+    // The priority should be Highest when setup() runs, not default Normal
     int8_t taskId = OS.createTask("priSetu", prioritySetupCapture_setup,
-                                  prioritySetupCapture_loop, 0, 15,
-                                  nullptr, true);
+                                  prioritySetupCapture_loop, 0,
+                                  nullptr, true, TaskPriority::Highest);
 
     assert(taskId >= 0);
 
     // setup() should have run during createTask (autoStart=true after begin)
-    // and captured the priority as 15
-    assert(capturedPriorityInSetup == 15);
+    // and captured the priority as Highest
+    assert(capturedPriorityInSetup == TaskPriority::Highest);
 
-    // Verify priority is still 15 after creation
-    assert(OS.getTaskPriority(taskId) == 15);
+    // Verify priority is still Highest after creation
+    assert(OS.getTaskPriority(taskId) == TaskPriority::Highest);
 
     printf("PASSED\n");
 }
@@ -4667,41 +5036,74 @@ void midCycleReady_loop() {
     midCycleReadyTaskRuns++;
 }
 
-void test_priority_uses_cycle_start_millis_snapshot() {
-    printf("Test: priority scheduling uses millis() snapshot from cycle start... ");
+void test_priority_uses_fresh_millis_for_readiness() {
+    printf("Test: priority scheduling uses fresh millis() for readiness checks... ");
     resetTestCounters();
     midCycleReadyTaskRuns = 0;
     midCycleTimeAdvanced = false;
 
     setMockMillis(0);
 
-    // High priority task (15) with interval=0 - runs every cycle
+    // High priority task with interval=0 - runs every cycle
     (void)OS.createTask("advncr", midCycleAdvancer_setup, midCycleAdvancer_loop,
-                        0, 15, nullptr, false);
+                        0, nullptr, false, TaskPriority::Highest);
 
-    // Low priority task (2) with interval=100ms - should NOT be ready at cycle start
+    // Low priority task with interval=100ms - not ready at cycle start
     (void)OS.createTask("waiter", midCycleReady_setup, midCycleReady_loop,
-                        100, 2, nullptr, false);
+                        100, nullptr, false, TaskPriority::Low);
 
-    OS.begin(false);
+    OS.begin();  // Tasks have autoStart=false
     OS.startAllTasks();
 
-    // At t=0, only the high-priority task should be ready
+    // At t=0, only the high-priority task is initially ready
     // The high-priority task advances time to t=200 mid-cycle
-    // But the low-priority task should NOT run because it wasn't ready
-    // at cycle start (millis() was 0, interval is 100, lastRun is 0)
+    // The low-priority task SHOULD run because readiness uses fresh millis(),
+    // and at t=200 the interval (100ms) has elapsed since lastRun (0)
     OS.run();
 
     // High priority task ran and advanced time
     assert(midCycleTimeAdvanced == true);
 
-    // Low priority task should NOT have run - it wasn't ready at cycle start
-    // (even though time is now 200ms due to mid-cycle advance)
-    assert(midCycleReadyTaskRuns == 0);
-
-    // Now run again - low priority task should be ready at this cycle's start
-    OS.run();
+    // Low priority task SHOULD have run - readiness uses fresh millis()
+    // so mid-cycle time advance makes the task ready
     assert(midCycleReadyTaskRuns == 1);
+
+    printf("PASSED\n");
+}
+
+// Test: task that restarts itself mid-cycle cannot run twice in same cycle
+static int8_t selfRestartTaskId = -1;
+static int selfRestartRunCount = 0;
+
+void selfRestart_setup() {}
+void selfRestart_loop() {
+    selfRestartRunCount++;
+    // Stop and immediately restart with runImmediately=true
+    OS.stopTask(selfRestartTaskId);
+    OS.startTask(selfRestartTaskId, true);  // runImmediately=true
+}
+
+void test_self_restart_no_double_execution() {
+    printf("Test: self-restart with runImmediately cannot run twice per cycle... ");
+    resetTestCounters();
+    selfRestartRunCount = 0;
+
+    selfRestartTaskId = OS.createTask("rstrt", selfRestart_setup, selfRestart_loop, 0);
+    OS.begin();
+
+    // Run one cycle
+    OS.run();
+
+    // Task should have run exactly once, even though it restarted itself with runImmediately=true
+    // The fix ensures ranThisCycle stays true when FLAG_IN_RUN is set
+    assert(selfRestartRunCount == 1);
+
+    // Task should still be in Running state (it restarted itself)
+    assert(OS.getTaskState(selfRestartTaskId) == TaskState::Running);
+
+    // Run another cycle - now it can run again
+    OS.run();
+    assert(selfRestartRunCount == 2);
 
     printf("PASSED\n");
 }
@@ -4730,22 +5132,30 @@ int main() {
     test_task_states();
     test_setup_called_on_start();
     test_start_task_run_immediately();
+    test_mid_cycle_start_no_immediate_run();
     test_trdwn_called();
     test_trdwn_sees_stopped_state();
     test_paused_task_not_executed();
     test_invalid_operations();
+    test_resume_running_task();
+    test_pause_already_paused_task();
+    test_double_resume();
     test_loop_self_stop();
+    test_self_stop_increments_runcount();
     test_loop_self_pause();
     test_setup_self_stop_returns_false();
     test_trdwn_self_restart_returns_partial();
+    test_teardown_deletes_other_running_task();
 
     // ---- Scheduler Control (begin/run/reset) ----
     test_begin_starts_all();
     test_begin_returns_count();
     test_begin_only_once();
     test_begin_no_autostart();
+    test_begin_with_prestarted_tasks();
     test_has_begun();
     test_run_before_begin();
+    test_run_reentrancy_detected();
     test_run_executes_tasks();
     test_reset();
     test_reset_clears_callbacks();
@@ -4756,18 +5166,20 @@ int main() {
     // ---- Auto-Start Behavior ----
     test_auto_start_after_begin();
     test_auto_start_disabled();
-    test_createTask_autostart_failure_preserves_error();
+    test_createTask_autostart_failure_returns_negative_one();
     test_begin_partial_failure_preserves_error();
+    test_begin_partial_failure_first_task_preserves_error();
 
     // ---- Interval & Timing ----
     test_interval_scheduling();
-    test_interval_cadence();
+    test_interval_minimum_gap();
     test_interval_catchup_prevention();
     test_interval_zero_runs_every_cycle();
     test_set_task_interval();
     test_set_interval_paused_task();
     test_set_task_interval_no_reset();
     test_setTaskInterval_on_deleted();
+    test_set_interval_to_zero_dynamically();
     test_get_task_interval();
     test_task_modifies_own_interval();
     test_uptime();
@@ -4784,12 +5196,21 @@ int main() {
 
     // ---- Task Execution & Run Count ----
     test_run_count();
+    test_getTaskLastRun_before_first_run();
+    test_getTaskLastRun_at_time_zero();
+    test_getTaskLastRun_runCount_overflow_skips_zero();
     test_runcount_returns_zero_for_deleted_task();
     test_null_loop_function();
     test_get_current_task();
 
     // ---- Deletion & Memory Management ----
     test_delete_task();
+    test_kill_task_running();
+    test_kill_task_stopped();
+    test_kill_task_paused();
+    test_kill_task_invalid_id();
+    test_kill_task_teardown_restarts();
+    test_kill_task_self();
     test_deleted_task_not_executed();
     test_deleted_task_returns_invalid();
     test_deleted_task_slot_fully_cleared();
@@ -4797,20 +5218,6 @@ int main() {
     test_self_deletion_prevented();
     test_double_delete();
     test_free_list_o1_allocation();
-
-    // ---- Yield ----
-    test_yield_reentrancy();
-    test_yield_runs_other_tasks();
-    test_yield_restores_inrun();
-    test_yield_in_setup_does_not_corrupt_inrun();
-    test_yield_outside_task_context();
-    test_yielded_task_deletion_prevented();
-    test_startTask_resets_inYield_flag();
-    test_is_task_yielded();
-    test_pause_task_during_yield();
-    test_delete_other_task_during_yield();
-    test_consecutive_yield_calls();
-    test_yield_from_trace_callback();
 
     // ---- Batch Operations ----
     test_batch_start_tasks();
@@ -4822,6 +5229,8 @@ int main() {
     test_batch_operations_zero_count();
     test_batch_failed_id();
     test_stopTasks_counts_partial_success();
+    test_stopTasks_preserves_teardown_error();
+    test_stopAllTasks_preserves_teardown_error();
 
     // ---- All-Tasks Operations ----
     test_start_all_tasks();
@@ -4831,10 +5240,14 @@ int main() {
     test_stopAllTasks_with_some_stopped();
     test_pauseAllTasks_with_mixed_states();
     test_resumeAllTasks_with_mixed_states();
+    test_startAllTasks_snapshot_safety();
+    test_stopAllTasks_snapshot_safety();
+    test_pauseAllTasks_snapshot_safety();
+    test_resumeAllTasks_snapshot_safety();
 
     // ---- Task Counting & Iteration ----
-    test_active_task_count();
-    test_active_count_o1();
+    test_get_task_count();
+    test_task_count_o1();
     test_get_slot_count();
     test_get_valid_task_ids();
     test_get_valid_task_ids_empty();
@@ -4845,7 +5258,7 @@ int main() {
     test_trace_callback();
     test_trace_pause_resume_delete();
     test_trace_task_stpng_event();
-    test_trace_stopped_emitted_on_callback_depth();
+    test_trace_skipped_on_callback_depth();
     test_trace_callback_modifies_state();
     test_reset_blocked_from_trace_callback();
     test_reset_blocked_from_timeout_callback();
@@ -4866,6 +5279,7 @@ int main() {
     test_error_codes();
     test_error_codes_max_tasks();
     test_success_clears_error();
+    test_clear_error_preserves_state();
     test_error_string();
     test_error_string_in_callback();
     test_getters_set_error_on_invalid();
@@ -4884,20 +5298,22 @@ int main() {
     test_priority_set_get();
     test_priority_create_with_priority();
     test_priority_invalid_task();
-    test_priority_clamp();
+    test_priority_rejected_if_invalid();
     test_priority_ordering();
     test_priority_same_level();
     test_priority_with_intervals();
     test_priority_enum_values();
     test_priority_preserved_across_stop_start();
     test_priority_set_before_setup_runs();
-    test_priority_uses_cycle_start_millis_snapshot();
+    test_priority_uses_fresh_millis_for_readiness();
+    test_self_restart_no_double_execution();
 #endif
 
     // ---- Miscellaneous ----
     test_get_max_tasks();
     test_version_constants();
     test_stop_result_enum_values();
+    test_start_result_enum_values();
     test_multiple_scheduler_instances();
 
     printf("\n=== All tests passed! ===\n\n");

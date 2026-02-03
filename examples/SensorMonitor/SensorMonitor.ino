@@ -164,9 +164,7 @@ void setup() {
         while (1) { ; }
     }
 
-    Serial.print(F("Monitoring "));
-    Serial.print(started);
-    Serial.println(F(" sensors...\n"));
+    Serial.println(F("Monitoring sensors...\n"));
 }
 
 void loop() {

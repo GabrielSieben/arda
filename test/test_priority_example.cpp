@@ -6,11 +6,13 @@
 uint32_t _mockMillis = 0;
 MockSerial Serial;
 
+// Disable shell for priority example compile test
+#define ARDA_NO_SHELL
 #include "../Arda.h"
 #include "../Arda.cpp"
 
 // ============================================
-// Low Priority Task (priority 4)
+// Low Priority Task (TaskPriority::Low)
 // ============================================
 TASK_SETUP(lowPri) {
     Serial.println("[Low] Initialized");
@@ -21,7 +23,7 @@ TASK_LOOP(lowPri) {
 }
 
 // ============================================
-// High Priority Task (priority 12)
+// High Priority Task (TaskPriority::High)
 // ============================================
 TASK_SETUP(highPri) {
     Serial.println("[High] Initialized");
@@ -32,7 +34,7 @@ TASK_LOOP(highPri) {
 }
 
 // ============================================
-// Medium Priority Task (priority 8 = Normal)
+// Medium Priority Task (TaskPriority::Normal)
 // ============================================
 TASK_SETUP(medPri) {
     Serial.println("[Medium] Initialized");
@@ -59,7 +61,7 @@ TASK_LOOP(critical) {
     // After 3 runs, lower our priority and slow down
     if (criticalRunCount >= 3) {
         Serial.println(">>> [Critical] Urgent work done, lowering priority");
-        OS.setTaskPriority(OS.getCurrentTask(), static_cast<uint8_t>(TaskPriority::Low));
+        OS.setTaskPriority(OS.getCurrentTask(), TaskPriority::Low);
         OS.setTaskInterval(OS.getCurrentTask(), 2000);
     }
 }
@@ -73,18 +75,19 @@ void setup() {
     Serial.println("=== Arda Priority Scheduling Demo ===\n");
 
     // Create tasks in "wrong" order to show priority overrides creation order
+    // Using full priority overload: (name, setup, loop, interval, teardown, autoStart, priority)
     int8_t lowId = OS.createTask("lowPri", lowPri_setup, lowPri_loop,
-                                  500, static_cast<uint8_t>(TaskPriority::Low));
+                                  500, nullptr, true, TaskPriority::Low);
 
     int8_t highId = OS.createTask("highPri", highPri_setup, highPri_loop,
-                                   500, static_cast<uint8_t>(TaskPriority::High));
+                                   500, nullptr, true, TaskPriority::High);
 
     int8_t medId = OS.createTask("medPri", medPri_setup, medPri_loop,
-                                  500, static_cast<uint8_t>(TaskPriority::Normal));
+                                  500, nullptr, true, TaskPriority::Normal);
 
     // Critical task starts at highest priority, runs every cycle initially
     int8_t critId = OS.createTask("crit", critical_setup, critical_loop,
-                                   0, static_cast<uint8_t>(TaskPriority::Highest));
+                                   0, nullptr, true, TaskPriority::Highest);
 
     if (lowId == -1 || highId == -1 || medId == -1 || critId == -1) {
         Serial.println("ERROR: Failed to create tasks!");
@@ -95,10 +98,10 @@ void setup() {
 
     // Print the priorities we assigned
     Serial.println("Task priorities:");
-    Serial.print("  lowPri:   "); Serial.println(OS.getTaskPriority(lowId));
-    Serial.print("  highPri:  "); Serial.println(OS.getTaskPriority(highId));
-    Serial.print("  medPri:   "); Serial.println(OS.getTaskPriority(medId));
-    Serial.print("  critical: "); Serial.println(OS.getTaskPriority(critId));
+    Serial.print("  lowPri:   "); Serial.println(static_cast<uint8_t>(OS.getTaskPriority(lowId)));
+    Serial.print("  highPri:  "); Serial.println(static_cast<uint8_t>(OS.getTaskPriority(highId)));
+    Serial.print("  medPri:   "); Serial.println(static_cast<uint8_t>(OS.getTaskPriority(medId)));
+    Serial.print("  critical: "); Serial.println(static_cast<uint8_t>(OS.getTaskPriority(critId)));
     Serial.println();
 
     // Start the scheduler

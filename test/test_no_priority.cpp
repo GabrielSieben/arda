@@ -14,8 +14,9 @@
 uint32_t _mockMillis = 0;
 MockSerial Serial;
 
-// Disable priority BEFORE including Arda
+// Disable priority and shell BEFORE including Arda
 #define ARDA_NO_PRIORITY
+#define ARDA_NO_SHELL
 #include "../Arda.h"
 #include "../Arda.cpp"
 
@@ -57,7 +58,7 @@ void test_priority_api_not_available() {
     // Arda os;
     // os.setTaskPriority(0, 5);  // Error: no member named 'setTaskPriority'
     // os.getTaskPriority(0);     // Error: no member named 'getTaskPriority'
-    // os.createTask("t", nullptr, nullptr, 0, 8, nullptr, false);  // Error: too many arguments
+    // os.createTask("t", nullptr, nullptr, 0, nullptr, false, 8);  // Error: too many arguments
     // TaskPriority p = TaskPriority::Normal;  // Error: undeclared identifier
 
     // Verify macros are not defined

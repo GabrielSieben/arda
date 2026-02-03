@@ -84,41 +84,121 @@ inline void randomSeed(unsigned long) {}
 #define lowByte(w) ((uint8_t)((w) & 0xff))
 #define highByte(w) ((uint8_t)((w) >> 8))
 
+// Base Stream class (Arduino provides this)
+class Stream {
+public:
+    virtual int available() = 0;
+    virtual int read() = 0;
+    virtual size_t write(uint8_t) = 0;
+
+    // print() overloads - covers all common Arduino types
+    virtual void print(const char* s) { printf("%s", s); }
+    virtual void print(char c) { printf("%c", c); }
+    virtual void print(int n) { printf("%d", n); }
+    virtual void print(unsigned int n) { printf("%u", n); }
+    virtual void print(long n) { printf("%ld", n); }
+    virtual void print(unsigned long n) { printf("%lu", n); }
+    virtual void print(int8_t n) { printf("%d", (int)n); }
+    virtual void print(uint8_t n) { printf("%u", (unsigned)n); }
+    virtual void print(double n, int precision = 2) { printf("%.*f", precision, n); }
+
+    // println() overloads
+    virtual void println() { printf("\n"); }
+    virtual void println(const char* s) { printf("%s\n", s); }
+    virtual void println(char c) { printf("%c\n", c); }
+    virtual void println(int n) { printf("%d\n", n); }
+    virtual void println(unsigned int n) { printf("%u\n", n); }
+    virtual void println(long n) { printf("%ld\n", n); }
+    virtual void println(unsigned long n) { printf("%lu\n", n); }
+    virtual void println(int8_t n) { printf("%d\n", (int)n); }
+    virtual void println(uint8_t n) { printf("%u\n", (unsigned)n); }
+    virtual void println(double n, int precision = 2) { printf("%.*f\n", precision, n); }
+
+    virtual int parseInt() { return 0; }
+
+    virtual ~Stream() {}
+};
+
 // Mock Serial - provides overloads for common Arduino types
 // Note: Avoid int32_t/uint32_t overloads as they may alias int/unsigned int on some platforms
-class MockSerial {
+class MockSerial : public Stream {
 public:
     void begin(long) {}
 
-    // print() overloads - covers all common Arduino types
-    void print(const char* s) { printf("%s", s); }
-    void print(char c) { printf("%c", c); }
-    void print(int n) { printf("%d", n); }
-    void print(unsigned int n) { printf("%u", n); }
-    void print(long n) { printf("%ld", n); }
-    void print(unsigned long n) { printf("%lu", n); }
-    void print(int8_t n) { printf("%d", (int)n); }
-    void print(uint8_t n) { printf("%u", (unsigned)n); }
-    void print(double n, int precision = 2) { printf("%.*f", precision, n); }
-
-    // println() overloads
-    void println() { printf("\n"); }
-    void println(const char* s) { printf("%s\n", s); }
-    void println(char c) { printf("%c\n", c); }
-    void println(int n) { printf("%d\n", n); }
-    void println(unsigned int n) { printf("%u\n", n); }
-    void println(long n) { printf("%ld\n", n); }
-    void println(unsigned long n) { printf("%lu\n", n); }
-    void println(int8_t n) { printf("%d\n", (int)n); }
-    void println(uint8_t n) { printf("%u\n", (unsigned)n); }
-    void println(double n, int precision = 2) { printf("%.*f\n", precision, n); }
-
-    // Input methods (mock - return defaults)
-    int available() { return 0; }
-    char read() { return 0; }
-    int parseInt() { return 0; }
+    // Input methods (mock - return defaults by default, can be overridden in tests)
+    int available() override { return 0; }
+    int read() override { return 0; }
+    size_t write(uint8_t) override { return 1; }
 
     operator bool() { return true; }
+};
+
+// MockStream with injectable input for testing shell
+class MockStream : public Stream {
+public:
+    const char* inputBuffer;
+    size_t inputPos;
+    char outputBuffer[1024];
+    size_t outputPos;
+
+    MockStream() : inputBuffer(nullptr), inputPos(0), outputPos(0) {
+        outputBuffer[0] = '\0';
+    }
+
+    void setInput(const char* input) {
+        inputBuffer = input;
+        inputPos = 0;
+    }
+
+    void clearOutput() {
+        outputPos = 0;
+        outputBuffer[0] = '\0';
+    }
+
+    int available() override {
+        if (!inputBuffer) return 0;
+        return inputBuffer[inputPos] != '\0' ? 1 : 0;
+    }
+
+    int read() override {
+        if (!inputBuffer || inputBuffer[inputPos] == '\0') return -1;
+        return inputBuffer[inputPos++];
+    }
+
+    size_t write(uint8_t c) override {
+        if (outputPos < sizeof(outputBuffer) - 1) {
+            outputBuffer[outputPos++] = c;
+            outputBuffer[outputPos] = '\0';
+        }
+        return 1;
+    }
+
+    // Override print/println to capture output
+    void print(const char* s) override {
+        while (*s && outputPos < sizeof(outputBuffer) - 1) {
+            outputBuffer[outputPos++] = *s++;
+        }
+        outputBuffer[outputPos] = '\0';
+    }
+    void print(char c) override { write(c); }
+    void print(int n) override { outputPos += snprintf(outputBuffer + outputPos, sizeof(outputBuffer) - outputPos, "%d", n); }
+    void print(unsigned int n) override { outputPos += snprintf(outputBuffer + outputPos, sizeof(outputBuffer) - outputPos, "%u", n); }
+    void print(long n) override { outputPos += snprintf(outputBuffer + outputPos, sizeof(outputBuffer) - outputPos, "%ld", n); }
+    void print(unsigned long n) override { outputPos += snprintf(outputBuffer + outputPos, sizeof(outputBuffer) - outputPos, "%lu", n); }
+    void print(int8_t n) override { outputPos += snprintf(outputBuffer + outputPos, sizeof(outputBuffer) - outputPos, "%d", (int)n); }
+    void print(uint8_t n) override { outputPos += snprintf(outputBuffer + outputPos, sizeof(outputBuffer) - outputPos, "%u", (unsigned)n); }
+
+    void println() override { print("\n"); }
+    void println(const char* s) override { print(s); print("\n"); }
+    void println(char c) override { print(c); print("\n"); }
+    void println(int n) override { print(n); print("\n"); }
+    void println(unsigned int n) override { print(n); print("\n"); }
+    void println(long n) override { print(n); print("\n"); }
+    void println(unsigned long n) override { print(n); print("\n"); }
+    void println(int8_t n) override { print(n); print("\n"); }
+    void println(uint8_t n) override { print(n); print("\n"); }
+
+    const char* getOutput() const { return outputBuffer; }
 };
 
 extern MockSerial Serial;

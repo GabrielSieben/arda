@@ -11,6 +11,7 @@ uint32_t _mockMillis = 0;
 MockSerial Serial;
 
 // Disable global OS instance BEFORE including Arda
+// Note: Shell requires global OS instance, so it's automatically disabled
 #define ARDA_NO_GLOBAL_INSTANCE
 #include "../Arda.h"
 #include "../Arda.cpp"

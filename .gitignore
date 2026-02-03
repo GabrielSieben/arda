@@ -6,10 +6,16 @@ test/test_example_compile
 test/test_case_insensitive
 test/test_custom_name_len
 test/test_no_global_instance
+test/test_no_global
 test/test_no_priority
 test/test_no_names
 test/test_priority_example
+test/test_shell
+test/test_shell_minimal
+test/test_no_shell
+test/test_short_errors
 test/test_arda_cov
+test/*_bin
 *.o
 
 # Coverage files
