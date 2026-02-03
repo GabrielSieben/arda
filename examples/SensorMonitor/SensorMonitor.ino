@@ -27,11 +27,11 @@
 // ============================================
 float lastTemp = 0;
 
-TASK_SETUP(temperature) {
+void temp_setup() {
     Serial.println(F("[Temp] Monitoring A0"));
 }
 
-TASK_LOOP(temperature) {
+void temp_loop() {
     int raw = analogRead(TEMP_PIN);
 
     // Convert to temperature (assumes TMP36: 10mV/C, 500mV at 0C)
@@ -56,11 +56,11 @@ TASK_LOOP(temperature) {
 // ============================================
 int lastLight = -999;  // Sentinel to force first reading to print
 
-TASK_SETUP(light) {
+void light_setup() {
     Serial.println(F("[Light] Monitoring A1"));
 }
 
-TASK_LOOP(light) {
+void light_loop() {
     int raw = analogRead(LIGHT_PIN);
 
     // Map to percentage (0-100%)
@@ -84,12 +84,12 @@ TASK_LOOP(light) {
 bool lastMotion = false;
 uint32_t motionTime = 0;
 
-TASK_SETUP(motion) {
+void motion_setup() {
     pinMode(MOTION_PIN, INPUT_PULLUP);
     Serial.println(F("[Motion] Monitoring pin 2"));
 }
 
-TASK_LOOP(motion) {
+void motion_loop() {
     bool detected = (digitalRead(MOTION_PIN) == LOW);  // Active low with pullup
 
     if (detected != lastMotion) {
@@ -109,11 +109,11 @@ TASK_LOOP(motion) {
 // ============================================
 // Status Task - periodic summary
 // ============================================
-TASK_SETUP(status) {
+void status_setup() {
     Serial.println(F("[Status] Will report every 10 seconds"));
 }
 
-TASK_LOOP(status) {
+void status_loop() {
     Serial.println(F("\n--- Status Report ---"));
     Serial.print(F("Uptime: "));
     Serial.print(OS.uptime() / 1000);
@@ -146,7 +146,7 @@ void setup() {
     Serial.println(F("=== Arda Sensor Monitor ===\n"));
 
     // Create tasks with appropriate intervals
-    int8_t tempId = OS.createTask("temp", temperature_setup, temperature_loop, 2000);
+    int8_t tempId = OS.createTask("temp", temp_setup, temp_loop, 2000);
     int8_t lightId = OS.createTask("light", light_setup, light_loop, 500);
     int8_t motionId = OS.createTask("motion", motion_setup, motion_loop, 0);  // Every cycle
     int8_t statusId = OS.createTask("status", status_setup, status_loop, 10000);

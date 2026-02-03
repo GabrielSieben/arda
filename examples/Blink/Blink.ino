@@ -9,12 +9,12 @@
 
 bool ledState = false;
 
-TASK_SETUP(blink) {
+void blink_setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     Serial.println(F("[Blink] LED initialized"));
 }
 
-TASK_LOOP(blink) {
+void blink_loop() {
     ledState = !ledState;
     digitalWrite(LED_BUILTIN, ledState ? HIGH : LOW);
 }
@@ -25,7 +25,7 @@ void setup() {
 
     Serial.println(F("=== Arda Blink Example ===\n"));
 
-    REGISTER_TASK_ID(blinkId, blink, 500);  // Blink every 500ms
+    int8_t blinkId = OS.createTask("blink", blink_setup, blink_loop, 500);
 
     if (blinkId == -1) {
         Serial.print(F("ERROR: Failed to create task: "));

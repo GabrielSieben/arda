@@ -18,17 +18,16 @@ Designed with AVR-class boards (e.g., ATmega328, 2KB RAM) in mind, with a focus 
 ```cpp
 #include "Arda.h"
 
-// Define a task using macros
-TASK_SETUP(blinker) {
-    pinMode(13, OUTPUT);
+void blinker_setup() {
+    pinMode(LED_BUILTIN, OUTPUT);
 }
 
-TASK_LOOP(blinker) {
-    digitalWrite(13, !digitalRead(13));
+void blinker_loop() {
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
 }
 
 void setup() {
-    REGISTER_TASK_ID(blinkerId, blinker, 500);  // Run every 500ms
+    int8_t blinkerId = OS.createTask("blinker", blinker_setup, blinker_loop, 500);
     if (blinkerId == -1) {
         // Handle error - task creation failed
         while (1) { }
@@ -141,7 +140,7 @@ switch (result) {
 |--------|-------------|
 | `begin()` | Initialize scheduler and start all registered tasks. Returns number successfully started, or -1 if already begun. Use `createTask(..., autoStart=false)` for tasks that should start in Stopped state. |
 | `run()` | Execute the scheduler (call in loop()). Returns false with `WrongState` error if `begin()` not called. |
-| `reset(preserveCallbacks)` | Stop all tasks and reset scheduler to initial state. By default clears user callbacks (timeout, startFailure, trace); set `preserveCallbacks=true` to keep them. Returns true if all teardowns ran, false if any were skipped (check `getError()`). |
+| `reset(preserveCallbacks)` | Stop all tasks and reset scheduler to initial state. You must call `begin()` again after reset to restart the scheduler. By default clears user callbacks (timeout, startFailure, trace); set `preserveCallbacks=true` to keep them. Returns true if all teardowns ran, false if any were skipped (check `getError()`). |
 | `yield()` | Give other tasks a chance to run. **Requires `ARDA_YIELD`.** **Discouraged**—see [Appendix: yield()](#appendix-yield). |
 | `uptime()` | Milliseconds since begin(), or 0 if begin() not yet called |
 | `hasBegun()` | Returns true if begin() has been called |
@@ -240,25 +239,41 @@ if (OS.isValidTask(taskId)) {
 | `ArdaError::NotSupported` | Feature disabled at compile time (e.g., `renameTask` when `ARDA_NO_NAMES` is defined) |
 | `ArdaError::InvalidValue` | Parameter value out of valid range (e.g., priority > 4) |
 
-## Macros
+## Macros (Optional)
 
-### Basic Macros
+Arda provides optional macros to reduce boilerplate. You can also use plain functions and `createTask()` directly—the macros just auto-generate function names to avoid repetition.
+
+**Without macros (recommended for clarity):**
+```cpp
+void blink_setup() { pinMode(LED_BUILTIN, OUTPUT); }
+void blink_loop() { digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); }
+
+void setup() {
+    int8_t blinkId = OS.createTask("blink", blink_setup, blink_loop, 500);
+    OS.begin();
+}
+```
+
+**With macros (less repetition, more magic):**
+```cpp
+TASK_SETUP(blink) { pinMode(LED_BUILTIN, OUTPUT); }
+TASK_LOOP(blink) { digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); }
+
+void setup() {
+    REGISTER_TASK_ID(blinkId, blink, 500);
+    OS.begin();
+}
+```
+
+### Available Macros
 
 ```cpp
 TASK_SETUP(name)      // Define setup function: void name_setup()
 TASK_LOOP(name)       // Define loop function: void name_loop()
 TASK_TEARDOWN(name)   // Define teardown function: void name_teardown()
 REGISTER_TASK(name, interval)  // Register task (discards returned ID)
+REGISTER_TASK_ID(id, name, interval)  // Register task and capture ID
 REGISTER_TASK_WITH_TEARDOWN(name, interval)
-```
-
-### Macros with ID Capture
-
-If you need to control tasks later, use these variants to capture the task ID:
-
-```cpp
-REGISTER_TASK_ID(myTaskId, blinker, 500);  // int8_t myTaskId = ...
-OS.pauseTask(myTaskId);  // Now you can control it
 ```
 
 ### Macros for Custom Scheduler Instances

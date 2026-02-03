@@ -46,7 +46,7 @@ void setLights(bool red, bool yellow, bool green) {
     digitalWrite(GREEN_PIN, green ? HIGH : LOW);
 }
 
-TASK_SETUP(trafficLight) {
+void light_setup() {
     pinMode(RED_PIN, OUTPUT);
     pinMode(YELLOW_PIN, OUTPUT);
     pinMode(GREEN_PIN, OUTPUT);
@@ -64,7 +64,7 @@ void changeInterval(uint32_t newInterval) {
     }
 }
 
-TASK_LOOP(trafficLight) {
+void light_loop() {
     // State machine transitions
     switch (currentState) {
         case LightState::Red:
@@ -111,12 +111,12 @@ TASK_LOOP(trafficLight) {
 // ============================================
 bool lastButtonState = HIGH;
 
-TASK_SETUP(pedestrian) {
+void button_setup() {
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     Serial.println(F("[Button] Ready (press for crosswalk)"));
 }
 
-TASK_LOOP(pedestrian) {
+void button_loop() {
     bool buttonState = digitalRead(BUTTON_PIN);
 
     // Detect button press (falling edge)
@@ -140,8 +140,8 @@ void setup() {
     Serial.println(F("=== Arda Traffic Light ===\n"));
 
     // Create tasks
-    lightTaskId = OS.createTask("light", trafficLight_setup, trafficLight_loop, RED_TIME);
-    int8_t buttonId = OS.createTask("button", pedestrian_setup, pedestrian_loop, 0);
+    lightTaskId = OS.createTask("light", light_setup, light_loop, RED_TIME);
+    int8_t buttonId = OS.createTask("button", button_setup, button_loop, 0);
 
     if (lightTaskId == -1 || buttonId == -1) {
         Serial.print(F("ERROR: Task creation failed: "));
