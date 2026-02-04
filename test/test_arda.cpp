@@ -28,6 +28,9 @@
 // Enable internal test accessor for Task* access without relying on memory layout
 #define ARDA_INTERNAL_TEST
 
+// Enable task recovery feature for timeout tests (not auto-enabled on non-AVR)
+#define ARDA_TASK_RECOVERY 1
+
 // Define mock variables
 uint32_t _mockMillis = 0;  // 32-bit to simulate Arduino's millis() ovrflow
 MockSerial Serial;
@@ -2067,9 +2070,9 @@ void test_version_constants() {
 
     // Verify version constants are defined and accessible
     assert(ARDA_VERSION_MAJOR == 1);
-    assert(ARDA_VERSION_MINOR == 1);
+    assert(ARDA_VERSION_MINOR == 2);
     assert(ARDA_VERSION_PATCH == 0);
-    assert(strncmp(ARDA_VERSION_STRING, "1.1.0", 16) == 0);
+    assert(strncmp(ARDA_VERSION_STRING, "1.2.0", 16) == 0);
 
     printf("PASSED\n");
 }
@@ -3716,6 +3719,254 @@ void test_setTaskTimeout_on_invalid() {
     printf("PASSED\n");
 }
 
+// For mid-loop timeout adjustment test
+static int8_t midLoopTimeoutTaskId = -1;
+static uint32_t midLoopCapturedTimeout1 = 0;
+static uint32_t midLoopCapturedTimeout2 = 0;
+static uint32_t midLoopCapturedTimeout3 = 0;
+static int midLoopTimeoutLoopCount = 0;
+
+void midLoopTimeout_setup() {}
+void midLoopTimeout_loop() {
+    midLoopTimeoutLoopCount++;
+
+    // Capture initial timeout
+    midLoopCapturedTimeout1 = OS.getTaskTimeout(midLoopTimeoutTaskId);
+
+    // Extend timeout mid-loop
+    OS.setTaskTimeout(midLoopTimeoutTaskId, 500);
+    midLoopCapturedTimeout2 = OS.getTaskTimeout(midLoopTimeoutTaskId);
+
+    // Disable timeout mid-loop
+    OS.setTaskTimeout(midLoopTimeoutTaskId, 0);
+    midLoopCapturedTimeout3 = OS.getTaskTimeout(midLoopTimeoutTaskId);
+
+    // Restore original
+    OS.setTaskTimeout(midLoopTimeoutTaskId, 100);
+}
+
+void test_setTaskTimeout_midloop() {
+    printf("Test: setTaskTimeout mid-loop updates timeout... ");
+    resetTestCounters();
+    midLoopTimeoutTaskId = -1;
+    midLoopCapturedTimeout1 = 0;
+    midLoopCapturedTimeout2 = 0;
+    midLoopCapturedTimeout3 = 0;
+    midLoopTimeoutLoopCount = 0;
+
+    // Create task with initial timeout
+    midLoopTimeoutTaskId = OS.createTask("midloop", midLoopTimeout_setup, midLoopTimeout_loop, 0);
+    assert(midLoopTimeoutTaskId >= 0);
+    OS.setTaskTimeout(midLoopTimeoutTaskId, 100);
+
+    OS.begin();
+    OS.run();
+
+    // Verify loop ran
+    assert(midLoopTimeoutLoopCount == 1);
+
+    // Verify timeout was captured correctly at each stage
+    assert(midLoopCapturedTimeout1 == 100);  // Initial timeout
+    assert(midLoopCapturedTimeout2 == 500);  // Extended timeout
+    assert(midLoopCapturedTimeout3 == 0);    // Disabled timeout
+
+    // Verify final timeout is restored
+    assert(OS.getTaskTimeout(midLoopTimeoutTaskId) == 100);
+
+    printf("PASSED\n");
+}
+
+// For mid-loop timeout callback suppression test
+static int8_t extendTimeoutTaskId = -1;
+static int extendTimeoutCallbackCount = 0;
+static int extendTimeoutLoopCount = 0;
+
+void extendTimeout_setup() {}
+void extendTimeout_loop() {
+    extendTimeoutLoopCount++;
+    // Start with 10ms timeout, but immediately extend to 200ms
+    // Loop takes ~50ms (simulated), which exceeds 10ms but not 200ms
+    OS.setTaskTimeout(extendTimeoutTaskId, 200);
+    _mockMillis += 50;  // Simulate 50ms of work
+}
+
+void extendTimeoutCallback(int8_t taskId, uint32_t duration) {
+    (void)taskId; (void)duration;
+    extendTimeoutCallbackCount++;
+}
+
+void test_setTaskTimeout_midloop_suppresses_callback() {
+    printf("Test: mid-loop timeout extension suppresses callback... ");
+    resetTestCounters();
+    extendTimeoutTaskId = -1;
+    extendTimeoutCallbackCount = 0;
+    extendTimeoutLoopCount = 0;
+
+    OS.setTimeoutCallback(extendTimeoutCallback);
+
+    // Create task with short initial timeout (10ms)
+    extendTimeoutTaskId = OS.createTask("extend", extendTimeout_setup, extendTimeout_loop, 0);
+    assert(extendTimeoutTaskId >= 0);
+    OS.setTaskTimeout(extendTimeoutTaskId, 10);  // Initial: 10ms
+
+    OS.begin();
+    OS.run();
+
+    // Verify loop ran
+    assert(extendTimeoutLoopCount == 1);
+
+    // The task extended timeout to 200ms mid-loop, then "took" 50ms
+    // 50ms < 200ms, so timeout callback should NOT fire
+    // (Even though 50ms > original 10ms)
+    assert(extendTimeoutCallbackCount == 0);
+
+    // Clean up
+    OS.setTimeoutCallback(nullptr);
+
+    printf("PASSED\n");
+}
+
+// heartbeat() is only available on AVR (ARDA_TASK_RECOVERY_IMPL=1)
+// On desktop, ARDA_TASK_RECOVERY_IMPL=0 so heartbeat() doesn't exist
+#if ARDA_TASK_RECOVERY_IMPL
+static int8_t heartbeatTaskId = -1;
+static bool heartbeatCalled = false;
+
+void heartbeat_setup() {}
+void heartbeat_loop() {
+    heartbeatCalled = OS.heartbeat();
+}
+
+void test_heartbeat_resets_timeout() {
+    printf("Test: heartbeat() resets timeout timer... ");
+    resetTestCounters();
+    heartbeatTaskId = -1;
+    heartbeatCalled = false;
+
+    heartbeatTaskId = OS.createTask("hb", heartbeat_setup, heartbeat_loop, 0);
+    assert(heartbeatTaskId >= 0);
+    OS.setTaskTimeout(heartbeatTaskId, 100);
+
+    OS.begin();
+    OS.run();
+
+    assert(heartbeatCalled == true);
+
+    printf("PASSED\n");
+}
+
+void test_heartbeat_outside_task_fails() {
+    printf("Test: heartbeat() outside task context fails... ");
+    resetTestCounters();
+
+    // heartbeat() called outside any task should fail
+    bool result = OS.heartbeat();
+    assert(result == false);
+    assert(OS.getError() == ArdaError::InvalidId);
+
+    printf("PASSED\n");
+}
+
+static int8_t noTimeoutTaskId = -1;
+static bool noTimeoutHeartbeatResult = true;
+static ArdaError noTimeoutHeartbeatError = ArdaError::Ok;
+
+void noTimeoutHeartbeat_setup() {}
+void noTimeoutHeartbeat_loop() {
+    noTimeoutHeartbeatResult = OS.heartbeat();
+    noTimeoutHeartbeatError = OS.getError();
+}
+
+void test_heartbeat_no_timeout_fails() {
+    printf("Test: heartbeat() with no timeout configured fails... ");
+    resetTestCounters();
+    noTimeoutTaskId = -1;
+    noTimeoutHeartbeatResult = true;
+    noTimeoutHeartbeatError = ArdaError::Ok;
+
+    // Create task without timeout (timeout=0 by default)
+    noTimeoutTaskId = OS.createTask("noTo", noTimeoutHeartbeat_setup, noTimeoutHeartbeat_loop, 0);
+    assert(noTimeoutTaskId >= 0);
+    // Don't set timeout - leave it at 0
+
+    OS.begin();
+    OS.run();
+
+    assert(noTimeoutHeartbeatResult == false);
+    assert(noTimeoutHeartbeatError == ArdaError::WrongState);
+
+    printf("PASSED\n");
+}
+#endif // ARDA_TASK_RECOVERY_IMPL
+
+// Test on all platforms where ARDA_TASK_RECOVERY is enabled
+#ifdef ARDA_TASK_RECOVERY
+void test_setTaskRecoveryEnabled_suppresses_callback() {
+    printf("Test: setTaskRecoveryEnabled(false) suppresses timeout callback... ");
+    resetTestCounters();
+    timeoutCallbackCalled = false;
+    capturedTimeoutDuration = 0;
+
+    OS.setTimeoutCallback(timeoutCallback);
+
+    // Create task that exceeds timeout
+    timeoutTaskId = OS.createTask("timeout", timeoutTask_setup, timeoutTask_loop, 0);
+    OS.setTaskTimeout(timeoutTaskId, 100);  // 100ms timeout, task takes 150ms
+
+    // Disable recovery globally
+    OS.setTaskRecoveryEnabled(false);
+
+    OS.begin();
+    OS.run();
+
+    // Timeout callback should NOT have been called even though task exceeded timeout
+    assert(timeoutCallbackCalled == false);
+
+    // Re-enable and verify callback fires
+    OS.setTaskRecoveryEnabled(true);
+    timeoutCallbackCalled = false;
+    OS.run();
+    assert(timeoutCallbackCalled == true);
+
+    // Clean up
+    OS.setTimeoutCallback(nullptr);
+
+    printf("PASSED\n");
+}
+
+void test_reset_restores_recoveryEnabled() {
+    printf("Test: reset() restores recoveryEnabled to true... ");
+    resetTestCounters();
+    timeoutCallbackCalled = false;
+
+    OS.setTimeoutCallback(timeoutCallback);
+
+    // Create task that exceeds timeout
+    timeoutTaskId = OS.createTask("timeout", timeoutTask_setup, timeoutTask_loop, 0);
+    OS.setTaskTimeout(timeoutTaskId, 100);
+
+    // Disable recovery
+    OS.setTaskRecoveryEnabled(false);
+    assert(OS.isTaskRecoveryEnabled() == false);
+
+    // Reset with preserveCallbacks=true so timeout callback remains
+    OS.reset(true);
+    assert(OS.isTaskRecoveryEnabled() == true);
+
+    // Recreate task and verify timeout callback fires
+    timeoutTaskId = OS.createTask("timeout", timeoutTask_setup, timeoutTask_loop, 0);
+    OS.setTaskTimeout(timeoutTaskId, 100);
+    OS.begin();
+    OS.run();
+    assert(timeoutCallbackCalled == true);
+
+    // Clean up
+    OS.setTimeoutCallback(nullptr);
+
+    printf("PASSED\n");
+}
+#endif // ARDA_TASK_RECOVERY
+
 void test_setTaskInterval_on_deleted() {
     printf("Test: setTaskInterval on deleted task... ");
     resetTestCounters();
@@ -5108,6 +5359,86 @@ void test_self_restart_no_double_execution() {
     printf("PASSED\n");
 }
 
+// Regression test: createTask with priority overload and autoStart=true
+// should auto-start when begin() is called (bug: RAN_BIT wasn't set)
+static int priorityAutoStartSetupCalled = 0;
+void priorityAutoStart_setup() { priorityAutoStartSetupCalled++; }
+void priorityAutoStart_loop() {}
+
+void test_priority_autostart_before_begin() {
+    printf("Test: priority createTask with autoStart=true before begin()... ");
+    resetTestCounters();
+    priorityAutoStartSetupCalled = 0;
+
+    Arda os;
+
+    // Create task with priority overload, autoStart=true, BEFORE begin()
+    int8_t id = os.createTask("priAuto", priorityAutoStart_setup, priorityAutoStart_loop,
+                              0, nullptr, true, TaskPriority::High);
+    assert(id >= 0);
+
+    // Setup should NOT have been called yet (begin() not called)
+    assert(priorityAutoStartSetupCalled == 0);
+    assert(os.getTaskState(id) == TaskState::Stopped);
+
+    // Now call begin() - this should auto-start the task
+    int8_t started = os.begin();
+    assert(started == 1);
+
+    // Setup should have been called by begin()
+    assert(priorityAutoStartSetupCalled == 1);
+    assert(os.getTaskState(id) == TaskState::Running);
+
+    printf("PASSED\n");
+}
+
+// Test: createTask overload with timeout and recover (requires ARDA_TASK_RECOVERY)
+#ifdef ARDA_TASK_RECOVERY
+static int timeoutRecoverCalled = 0;
+void timeoutRecover_setup() {}
+void timeoutRecover_loop() {}
+void timeoutRecover_recover() { timeoutRecoverCalled++; }
+
+void test_createTask_with_timeout_and_recover() {
+    printf("Test: createTask overload with timeout and recover... ");
+    resetTestCounters();
+    timeoutRecoverCalled = 0;
+
+    Arda os;
+
+    // Create task with timeout and recover in one call
+    int8_t id = os.createTask("timedTask", timeoutRecover_setup, timeoutRecover_loop,
+                              100, nullptr, false, TaskPriority::Normal,
+                              50, timeoutRecover_recover);  // 50ms timeout
+    assert(id >= 0);
+
+    // Verify timeout was set
+    assert(os.getTaskTimeout(id) == 50);
+
+    // Verify recover callback was set (use internal accessor since hasTaskRecover
+    // returns false on non-AVR test platforms where ARDA_TASK_RECOVERY_IMPL=0)
+    Task* task = os.getTaskPtr_(id);
+    assert(task != nullptr);
+    assert(task->recover == timeoutRecover_recover);
+
+    // Verify priority was set correctly
+    assert(os.getTaskPriority(id) == TaskPriority::Normal);
+
+    // Create another with timeout=0 (disabled)
+    int8_t id2 = os.createTask("noTimeout", timeoutRecover_setup, timeoutRecover_loop,
+                               100, nullptr, false, TaskPriority::High,
+                               0, nullptr);  // timeout disabled, no recover
+    assert(id2 >= 0);
+    assert(os.getTaskTimeout(id2) == 0);
+    Task* task2 = os.getTaskPtr_(id2);
+    assert(task2 != nullptr);
+    assert(task2->recover == nullptr);
+    assert(os.getTaskPriority(id2) == TaskPriority::High);
+
+    printf("PASSED\n");
+}
+#endif // ARDA_TASK_RECOVERY
+
 #endif // ARDA_NO_PRIORITY
 
 int main() {
@@ -5193,6 +5524,17 @@ int main() {
     test_timeout_without_callback();
     test_get_task_timeout_invalid();
     test_setTaskTimeout_on_invalid();
+    test_setTaskTimeout_midloop();
+    test_setTaskTimeout_midloop_suppresses_callback();
+#if ARDA_TASK_RECOVERY_IMPL
+    test_heartbeat_resets_timeout();
+    test_heartbeat_outside_task_fails();
+    test_heartbeat_no_timeout_fails();
+#endif
+#ifdef ARDA_TASK_RECOVERY
+    test_setTaskRecoveryEnabled_suppresses_callback();
+    test_reset_restores_recoveryEnabled();
+#endif
 
     // ---- Task Execution & Run Count ----
     test_run_count();
@@ -5307,6 +5649,10 @@ int main() {
     test_priority_set_before_setup_runs();
     test_priority_uses_fresh_millis_for_readiness();
     test_self_restart_no_double_execution();
+    test_priority_autostart_before_begin();
+#ifdef ARDA_TASK_RECOVERY
+    test_createTask_with_timeout_and_recover();
+#endif
 #endif
 
     // ---- Miscellaneous ----

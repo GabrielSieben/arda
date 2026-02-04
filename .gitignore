@@ -12,8 +12,10 @@ test/test_no_names
 test/test_priority_example
 test/test_shell
 test/test_shell_minimal
+test/test_shell_manual_start
 test/test_no_shell
 test/test_short_errors
+test/test_yield
 test/test_arda_cov
 test/*_bin
 *.o
@@ -30,9 +32,10 @@ test/*.gcno
 build/
 cmake-build-*/
 
-# IDE files
+# IDE and tool files
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 *~

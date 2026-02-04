@@ -32,6 +32,110 @@ void ardaShellLoop_();  // Forward decl for constructor (non-static, declared fr
 #endif
 
 // =============================================================================
+// Task Recovery (Timer2 soft watchdog) - AVR only
+// =============================================================================
+
+#ifdef ARDA_TASK_RECOVERY
+#if ARDA_TASK_RECOVERY_IMPL
+
+// Timer2 overflow calculation constants
+// Timer2 with /1024 prescaler overflows every (256 * 1024 / F_CPU) seconds
+// ARDA_TICKS_PER_MS = F_CPU / 1000 = ticks per millisecond
+// ARDA_MAX_SAFE_TIMEOUT_MS = max timeout before uint32 multiplication overflow
+static const uint32_t ARDA_TICKS_PER_MS = (F_CPU / 1000UL);
+static const uint32_t ARDA_MAX_SAFE_TIMEOUT_MS = ((UINT32_MAX / ARDA_TICKS_PER_MS) - 1UL);
+
+// Static member definitions
+jmp_buf Arda::recoveryJumpBuf_;
+volatile int8_t Arda::recoveryTask_ = -1;
+volatile bool Arda::recoveryFired_ = false;
+volatile uint16_t Arda::recoveryOverflowsRemaining_ = 0;
+volatile bool Arda::recoveryInCallback_ = false;
+volatile bool Arda::recoveryArmed_ = false;
+volatile bool Arda::recoveryEnabled_ = true;      // Enabled by default
+
+// Initialize Timer2 for task recovery (called in begin())
+void Arda::initTaskRecovery() {
+    TCCR2A = 0;                     // Normal mode
+    TCCR2B = 0;                     // Timer stopped
+    TIMSK2 = 0;                     // Interrupts disabled until armed
+}
+
+// Arm recovery timer (called AFTER setjmp, before task->loop())
+void Arda::armRecoveryTimer(int8_t taskId, uint32_t timeoutMs) {
+    uint8_t sreg = SREG;
+    cli();                          // Atomic setup
+
+    // Don't arm if globally disabled OR already armed
+    if (!recoveryEnabled_ || recoveryArmed_) {
+        SREG = sreg;
+        return;
+    }
+
+    recoveryTask_ = taskId;
+    recoveryFired_ = false;
+
+    // Timer2 with /1024 prescaler overflows every (256 * 1024 / F_CPU) seconds
+    // Overflow period in ms = 262144000 / F_CPU
+    // At 16MHz: 16.384ms, at 8MHz: 32.768ms, at 20MHz: 13.1ms
+    //
+    // Formula: overflows = timeoutMs * (F_CPU / 1000) / 262144
+    uint16_t overflows;
+    if (timeoutMs > ARDA_MAX_SAFE_TIMEOUT_MS) {
+        overflows = UINT16_MAX;  // Saturate to max (~17 min at 16MHz)
+    } else {
+        // Round to nearest (add half divisor before division)
+        overflows = (uint16_t)(((timeoutMs * ARDA_TICKS_PER_MS) + 131072UL) / 262144UL);
+    }
+    if (overflows == 0) overflows = 1;  // Minimum 1 overflow
+
+    recoveryOverflowsRemaining_ = overflows;
+    TCCR2A = 0;                     // Ensure normal mode (not PWM)
+    TCCR2B = 0;                     // Stop timer first
+    TCNT2 = 0;
+    TIFR2 = (1 << TOV2);            // Clear pending overflow flag
+    recoveryArmed_ = true;          // Enable ISR logic
+    TIMSK2 = (1 << TOIE2);          // Enable overflow interrupt
+    TCCR2B = (1 << CS22) | (1 << CS21) | (1 << CS20);  // /1024 prescaler, start
+
+    SREG = sreg;                    // Restore interrupt state
+}
+
+// Disarm recovery timer (called after task returns normally)
+void Arda::disarmRecoveryTimer() {
+    uint8_t sreg = SREG;
+    cli();                          // Atomic disarm
+
+    recoveryArmed_ = false;         // Disable ISR logic first
+    TCCR2B = 0;                     // Stop timer
+    TIMSK2 = 0;                     // Disable interrupt
+    TIFR2 = (1 << TOV2);            // Clear any pending flag
+    recoveryTask_ = -1;
+
+    SREG = sreg;
+}
+
+// Timer2 overflow ISR
+ISR(TIMER2_OVF_vect) {
+    if (!Arda::recoveryArmed_ || !Arda::recoveryEnabled_) return;  // Guard against spurious interrupts
+
+    if (--Arda::recoveryOverflowsRemaining_ == 0) {
+        // Timeout reached - stop timer and abort
+        Arda::recoveryArmed_ = false;
+        TCCR2B = 0;
+        TIMSK2 = 0;
+        Arda::recoveryFired_ = true;
+
+        // longjmp restores stack but NOT SREG on AVR - caller must sei()
+        longjmp(Arda::recoveryJumpBuf_, 1);
+    }
+    // Otherwise, keep counting overflows
+}
+
+#endif // ARDA_TASK_RECOVERY_IMPL
+#endif // ARDA_TASK_RECOVERY
+
+// =============================================================================
 // Constructor
 // =============================================================================
 
@@ -71,10 +175,15 @@ Arda::Arda() {
         tasks[i].setup = nullptr;
         tasks[i].loop = nullptr;
         tasks[i].teardown = nullptr;
+#ifdef ARDA_TASK_RECOVERY
+        tasks[i].recover = nullptr;
+#endif
         tasks[i].interval = 0;
         tasks[i].lastRun = 0;
         tasks[i].runCount = 0;
+#ifdef ARDA_TASK_RECOVERY
         tasks[i].timeout = 0;
+#endif
 #ifdef ARDA_NO_NAMES
   #ifndef ARDA_NO_PRIORITY
         tasks[i].flags = (ARDA_DEFAULT_PRIORITY << ARDA_TASK_PRIORITY_SHIFT) | ARDA_TASK_DELETED_STATE;
@@ -98,7 +207,12 @@ Arda::Arda() {
     callbackDepth = 0;
     flags_ = 0;
     error_ = ArdaError::Ok;
+#ifdef ARDA_TASK_RECOVERY
     timeoutCallback = nullptr;
+#if !ARDA_TASK_RECOVERY_IMPL
+    recoveryEnabled_ = true;  // Enabled by default on non-AVR
+#endif
+#endif
     startFailureCallback = nullptr;
     traceCallback = nullptr;
 }
@@ -115,10 +229,15 @@ void Arda::initShell_() {
     tasks[0].setup = nullptr;
     tasks[0].loop = ardaShellLoop_;
     tasks[0].teardown = nullptr;
+#ifdef ARDA_TASK_RECOVERY
+    tasks[0].recover = nullptr;
+#endif
     tasks[0].interval = 0;
     tasks[0].lastRun = 0;
     tasks[0].runCount = 0;
+#ifdef ARDA_TASK_RECOVERY
     tasks[0].timeout = 0;
+#endif
 #ifndef ARDA_NO_PRIORITY
     tasks[0].flags = (ARDA_DEFAULT_PRIORITY << ARDA_TASK_PRIORITY_SHIFT);
 #else
@@ -148,6 +267,12 @@ int8_t Arda::begin() {
 
 #ifdef ARDA_WATCHDOG
     wdt_enable(WDTO_8S);
+#endif
+
+#ifdef ARDA_TASK_RECOVERY
+#if ARDA_TASK_RECOVERY_IMPL
+    initTaskRecovery();
+#endif
 #endif
 
     int8_t started = 0;
@@ -304,33 +429,150 @@ void Arda::runInternal(int8_t skipTask) {
             taskRan = true;
             int8_t prevTask = currentTask;
             currentTask = i;
-            updateRanThisCycle(tasks[i], true);
-            callbackDepth++;
 
+            emitTrace(i, TraceEvent::TaskLoopBegin);
+            uint32_t execStart = millis();
+
+            // ARDA_WATCHDOG and ARDA_TASK_RECOVERY are mutually exclusive (compile-time error)
 #ifdef ARDA_WATCHDOG
             wdt_reset();
 #endif
-            emitTrace(i, TraceEvent::TaskLoopBegin);
-            uint32_t execStart = millis();
+
+#ifdef ARDA_TASK_RECOVERY
+#if ARDA_TASK_RECOVERY_IMPL
+            bool wasAborted = false;
+            uint32_t cachedTimeout = tasks[i].timeout;  // Cache before potential invalidation
+            bool recEnabled = recoveryEnabled_;  // Cache volatile read once per task
+
+            // Mark as run BEFORE any execution - must happen for ALL tasks (even timeout=0)
+            updateRanThisCycle(tasks[i], true);
+
+            // Check global enable AND per-task timeout
+            if (recEnabled && cachedTimeout > 0) {
+                // Save state that may be corrupted by longjmp
+                uint8_t savedCallbackDepth = callbackDepth;
+
+                if (setjmp(recoveryJumpBuf_) == 0) {
+                    // Normal path - arm timer AFTER setjmp establishes jump point
+                    recoveryInCallback_ = false;
+                    armRecoveryTimer(i, cachedTimeout);
+                    callbackDepth++;  // Track callback depth for loop()
+                    tasks[i].loop();
+                    callbackDepth--;
+                    disarmRecoveryTimer();
+                } else {
+                    // longjmp landed here - INTERRUPTS ARE DISABLED!
+                    disarmRecoveryTimer();
+                    sei();  // Re-enable interrupts (longjmp doesn't restore SREG on AVR)
+                    callbackDepth = savedCallbackDepth;  // Restore corrupted depth
+
+                    // Re-validate task - could have been invalidated before timeout fired
+                    if (!isValidTask(i)) {
+                        recoveryInCallback_ = false;
+                        wasAborted = true;
+                    } else if (!recoveryInCallback_) {
+                        // Task itself timed out - try recover()
+                        wasAborted = true;
+                        error_ = ArdaError::TaskAborted;
+                        emitTrace(i, TraceEvent::TaskAborted);
+
+#ifdef ARDA_SHELL_ACTIVE
+                        // Clear partial shell command buffer if shell task was aborted
+                        if (i == ARDA_SHELL_TASK_ID) {
+                            shellBufIdx_ = 0;
+                        }
+#endif
+
+                        if (tasks[i].recover) {
+                            // Arm timer again for recover() - use current timeout
+                            // (task may have adjusted it mid-loop via setTaskTimeout)
+                            if (setjmp(recoveryJumpBuf_) == 0) {
+                                recoveryInCallback_ = true;
+                                armRecoveryTimer(i, tasks[i].timeout);
+                                callbackDepth++;  // Track callback depth for recover()
+                                tasks[i].recover();
+                                callbackDepth--;
+                                disarmRecoveryTimer();
+                                recoveryInCallback_ = false;
+                            } else {
+                                // recover() also timed out - longjmp landed here
+                                disarmRecoveryTimer();
+                                sei();
+                                callbackDepth--;  // Undo recover() increment
+                                recoveryInCallback_ = false;
+                                emitTrace(i, TraceEvent::RecoverAborted);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No timeout set - run without recovery protection
+                // (updateRanThisCycle already called above for ALL tasks)
+                callbackDepth++;
+                tasks[i].loop();
+                callbackDepth--;
+            }
+#else
+            // Hardware doesn't support recovery - run task normally
+            updateRanThisCycle(tasks[i], true);
+            callbackDepth++;
             tasks[i].loop();
+            callbackDepth--;
+#endif
+#else
+            // ARDA_TASK_RECOVERY not enabled - original code
+            updateRanThisCycle(tasks[i], true);
+            callbackDepth++;
+            tasks[i].loop();
+            callbackDepth--;
+#endif
+
             uint32_t execDuration = millis() - execStart;
             emitTrace(i, TraceEvent::TaskLoopEnd);
 
-            callbackDepth--;
             currentTask = prevTask;
 
-            if (tasks[i].timeout > 0 && execDuration > tasks[i].timeout && timeoutCallback != nullptr && callbackDepth < ARDA_MAX_CALLBACK_DEPTH) {
+            // Update run statistics (happens for both normal and aborted tasks)
+#ifdef ARDA_TASK_RECOVERY
+#if ARDA_TASK_RECOVERY_IMPL
+            if (isValidTask(i)) {
+#endif
+#endif
+                if (++tasks[i].runCount == 0) tasks[i].runCount = 1;  // Skip 0 on overflow
+                tasks[i].lastRun = execStart;
+#ifdef ARDA_TASK_RECOVERY
+#if ARDA_TASK_RECOVERY_IMPL
+            }
+#endif
+#endif
+
+#ifdef ARDA_TASK_RECOVERY
+#if ARDA_TASK_RECOVERY_IMPL
+            // Skip soft timeout callback if task was hard-aborted (already notified via trace)
+            // Use current timeout if task is still valid (may have been adjusted mid-loop)
+            if (wasAborted) {
+                execDuration = isValidTask(i) ? tasks[i].timeout : cachedTimeout;
+            }
+            // Only fire timeout callback if recovery enabled (re-read in case task disabled it mid-loop), NOT aborted
+            // Use current tasks[i].timeout (not cachedTimeout) in case task adjusted it mid-loop
+            uint32_t finalTimeout = tasks[i].timeout;
+            if (recoveryEnabled_ && !wasAborted && finalTimeout > 0 && execDuration > finalTimeout
+                && timeoutCallback && callbackDepth < ARDA_MAX_CALLBACK_DEPTH) {
                 callbackDepth++;
                 timeoutCallback(i, execDuration);
                 callbackDepth--;
             }
-
-            // Always count the run and update lastRun - the loop() executed regardless of
-            // whether the task stopped/paused itself during execution.
-            // Use execStart (not current millis()) so interval measures start-to-start,
-            // matching documented behavior: "100ms interval last ran at t=100 → next at t=200"
-            if (++tasks[i].runCount == 0) tasks[i].runCount = 1;  // Skip 0 on overflow
-            tasks[i].lastRun = execStart;
+#else
+            // Non-AVR: software timeout callback only (no hardware abort)
+            // Check recoveryEnabled_ to honor setTaskRecoveryEnabled()
+            if (recoveryEnabled_ && tasks[i].timeout > 0 && execDuration > tasks[i].timeout
+                && timeoutCallback != nullptr && callbackDepth < ARDA_MAX_CALLBACK_DEPTH) {
+                callbackDepth++;
+                timeoutCallback(i, execDuration);
+                callbackDepth--;
+            }
+#endif
+#endif
 
 #ifdef ARDA_SHELL_ACTIVE
             // Handle deferred self-deletion (e.g., shell killing itself with 'k 0')
@@ -362,38 +604,150 @@ void Arda::runInternal(int8_t skipTask) {
             }
             int8_t prevTask = currentTask;
             currentTask = i;
-            updateRanThisCycle(tasks[i], true);  // Mark as run before executing (in case of yield)
-            callbackDepth++;
 
-            // Track execution time for timeout detection
-            // NOTE: Unsigned arithmetic correctly handles millis() overflow here.
-            // If millis() wraps during execution (e.g., 4294967290 -> 94), the
-            // subtraction still yields the correct duration due to unsigned wraparound.
+            emitTrace(i, TraceEvent::TaskLoopBegin);
+            uint32_t execStart = millis();
+
+            // ARDA_WATCHDOG and ARDA_TASK_RECOVERY are mutually exclusive (compile-time error)
 #ifdef ARDA_WATCHDOG
             wdt_reset();
 #endif
-            emitTrace(i, TraceEvent::TaskLoopBegin);
-            uint32_t execStart = millis();
+
+#ifdef ARDA_TASK_RECOVERY
+#if ARDA_TASK_RECOVERY_IMPL
+            bool wasAborted = false;
+            uint32_t cachedTimeout = tasks[i].timeout;  // Cache before potential invalidation
+            bool recEnabled = recoveryEnabled_;  // Cache volatile read once per task
+
+            // Mark as run BEFORE any execution - must happen for ALL tasks (even timeout=0)
+            updateRanThisCycle(tasks[i], true);
+
+            // Check global enable AND per-task timeout
+            if (recEnabled && cachedTimeout > 0) {
+                // Save state that may be corrupted by longjmp
+                uint8_t savedCallbackDepth = callbackDepth;
+
+                if (setjmp(recoveryJumpBuf_) == 0) {
+                    // Normal path - arm timer AFTER setjmp establishes jump point
+                    recoveryInCallback_ = false;
+                    armRecoveryTimer(i, cachedTimeout);
+                    callbackDepth++;  // Track callback depth for loop()
+                    tasks[i].loop();
+                    callbackDepth--;
+                    disarmRecoveryTimer();
+                } else {
+                    // longjmp landed here - INTERRUPTS ARE DISABLED!
+                    disarmRecoveryTimer();
+                    sei();  // Re-enable interrupts (longjmp doesn't restore SREG on AVR)
+                    callbackDepth = savedCallbackDepth;  // Restore corrupted depth
+
+                    // Re-validate task - could have been invalidated before timeout fired
+                    if (!isValidTask(i)) {
+                        recoveryInCallback_ = false;
+                        wasAborted = true;
+                    } else if (!recoveryInCallback_) {
+                        // Task itself timed out - try recover()
+                        wasAborted = true;
+                        error_ = ArdaError::TaskAborted;
+                        emitTrace(i, TraceEvent::TaskAborted);
+
+#ifdef ARDA_SHELL_ACTIVE
+                        // Clear partial shell command buffer if shell task was aborted
+                        if (i == ARDA_SHELL_TASK_ID) {
+                            shellBufIdx_ = 0;
+                        }
+#endif
+
+                        if (tasks[i].recover) {
+                            // Arm timer again for recover() - use current timeout
+                            // (task may have adjusted it mid-loop via setTaskTimeout)
+                            if (setjmp(recoveryJumpBuf_) == 0) {
+                                recoveryInCallback_ = true;
+                                armRecoveryTimer(i, tasks[i].timeout);
+                                callbackDepth++;  // Track callback depth for recover()
+                                tasks[i].recover();
+                                callbackDepth--;
+                                disarmRecoveryTimer();
+                                recoveryInCallback_ = false;
+                            } else {
+                                // recover() also timed out - longjmp landed here
+                                disarmRecoveryTimer();
+                                sei();
+                                callbackDepth--;  // Undo recover() increment
+                                recoveryInCallback_ = false;
+                                emitTrace(i, TraceEvent::RecoverAborted);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No timeout set - run without recovery protection
+                // (updateRanThisCycle already called above for ALL tasks)
+                callbackDepth++;
+                tasks[i].loop();
+                callbackDepth--;
+            }
+#else
+            // Hardware doesn't support recovery - run task normally
+            updateRanThisCycle(tasks[i], true);
+            callbackDepth++;
             tasks[i].loop();
+            callbackDepth--;
+#endif
+#else
+            // ARDA_TASK_RECOVERY not enabled - original code
+            updateRanThisCycle(tasks[i], true);
+            callbackDepth++;
+            tasks[i].loop();
+            callbackDepth--;
+#endif
+
             uint32_t execDuration = millis() - execStart;
             emitTrace(i, TraceEvent::TaskLoopEnd);
 
-            callbackDepth--;
             currentTask = prevTask;
 
-            // Check for timeout (only if timeout is configured and callback is set)
-            if (tasks[i].timeout > 0 && execDuration > tasks[i].timeout && timeoutCallback != nullptr && callbackDepth < ARDA_MAX_CALLBACK_DEPTH) {
+            // Update run statistics (happens for both normal and aborted tasks)
+#ifdef ARDA_TASK_RECOVERY
+#if ARDA_TASK_RECOVERY_IMPL
+            if (isValidTask(i)) {
+#endif
+#endif
+                if (++tasks[i].runCount == 0) tasks[i].runCount = 1;  // Skip 0 on overflow
+                tasks[i].lastRun = execStart;
+#ifdef ARDA_TASK_RECOVERY
+#if ARDA_TASK_RECOVERY_IMPL
+            }
+#endif
+#endif
+
+#ifdef ARDA_TASK_RECOVERY
+#if ARDA_TASK_RECOVERY_IMPL
+            // Skip soft timeout callback if task was hard-aborted (already notified via trace)
+            // Use current timeout if task is still valid (may have been adjusted mid-loop)
+            if (wasAborted) {
+                execDuration = isValidTask(i) ? tasks[i].timeout : cachedTimeout;
+            }
+            // Only fire timeout callback if recovery enabled (re-read in case task disabled it mid-loop), NOT aborted
+            // Use current tasks[i].timeout (not cachedTimeout) in case task adjusted it mid-loop
+            uint32_t finalTimeout = tasks[i].timeout;
+            if (recoveryEnabled_ && !wasAborted && finalTimeout > 0 && execDuration > finalTimeout
+                && timeoutCallback && callbackDepth < ARDA_MAX_CALLBACK_DEPTH) {
                 callbackDepth++;
                 timeoutCallback(i, execDuration);
                 callbackDepth--;
             }
-
-            // Always count the run and update lastRun - the loop() executed regardless of
-            // whether the task stopped/paused itself during execution.
-            // Use execStart (not current millis()) so interval measures start-to-start,
-            // matching documented behavior: "100ms interval last ran at t=100 → next at t=200"
-            if (++tasks[i].runCount == 0) tasks[i].runCount = 1;  // Skip 0 on overflow
-            tasks[i].lastRun = execStart;
+#else
+            // Non-AVR: software timeout callback only (no hardware abort)
+            // Check recoveryEnabled_ to honor setTaskRecoveryEnabled()
+            if (recoveryEnabled_ && tasks[i].timeout > 0 && execDuration > tasks[i].timeout
+                && timeoutCallback != nullptr && callbackDepth < ARDA_MAX_CALLBACK_DEPTH) {
+                callbackDepth++;
+                timeoutCallback(i, execDuration);
+                callbackDepth--;
+            }
+#endif
+#endif
 
 #ifdef ARDA_SHELL_ACTIVE
             // Handle deferred self-deletion (e.g., shell killing itself with 'k 0')
@@ -422,6 +776,19 @@ bool Arda::reset(bool preserveCallbacks) {
 
 #ifdef ARDA_WATCHDOG
     wdt_disable();
+#endif
+
+#ifdef ARDA_TASK_RECOVERY
+#if ARDA_TASK_RECOVERY_IMPL
+    // Disable Timer2 before clearing state - ISR could longjmp to invalid target
+    TCCR2B = 0;                     // Stop timer
+    TIMSK2 = 0;                     // Disable interrupt
+    TIFR2 = (1 << TOV2);            // Clear pending flag
+    recoveryArmed_ = false;
+    recoveryEnabled_ = true;        // Restore default enabled state
+#else
+    recoveryEnabled_ = true;        // Restore default enabled state (non-AVR)
+#endif
 #endif
 
     bool allTeardownsRan = true;
@@ -457,10 +824,15 @@ bool Arda::reset(bool preserveCallbacks) {
         tasks[i].setup = nullptr;
         tasks[i].loop = nullptr;
         tasks[i].teardown = nullptr;
+#ifdef ARDA_TASK_RECOVERY
+        tasks[i].recover = nullptr;
+#endif
         tasks[i].interval = 0;
         tasks[i].lastRun = 0;
         tasks[i].runCount = 0;    // Union member; nextFree shares this memory
+#ifdef ARDA_TASK_RECOVERY
         tasks[i].timeout = 0;
+#endif
 #ifdef ARDA_NO_NAMES
         // Mark as deleted using state value 3
   #ifndef ARDA_NO_PRIORITY
@@ -500,7 +872,9 @@ bool Arda::reset(bool preserveCallbacks) {
 
     // Optionally clear user callbacks for a complete clean slate
     if (!preserveCallbacks) {
+#ifdef ARDA_TASK_RECOVERY
         timeoutCallback = nullptr;
+#endif
         startFailureCallback = nullptr;
         traceCallback = nullptr;
     }
@@ -529,10 +903,15 @@ int8_t Arda::initTaskFields_(int8_t id, TaskCallback setup, TaskCallback loop,
     tasks[id].setup = setup;
     tasks[id].loop = loop;
     tasks[id].teardown = teardown;
+#ifdef ARDA_TASK_RECOVERY
+    tasks[id].recover = nullptr;
+#endif
     tasks[id].interval = intervalMs;
     tasks[id].lastRun = 0;
     tasks[id].runCount = 0;    // Union member; nextFree shares this memory
+#ifdef ARDA_TASK_RECOVERY
     tasks[id].timeout = 0;
+#endif
 #ifndef ARDA_NO_PRIORITY
     tasks[id].flags = ARDA_DEFAULT_PRIORITY << ARDA_TASK_PRIORITY_SHIFT;
 #else
@@ -640,17 +1019,36 @@ int8_t Arda::createTask(const char* name, TaskCallback setup, TaskCallback loop,
     int8_t id = createTask(name, setup, loop, intervalMs, teardown, false);
     if (id >= 0) {
         updatePriority(tasks[id], rawPriority);
-        // Now handle auto-start if requested and begin() was already called
-        if ((flags_ & FLAG_BEGUN) && autoStart) {
-            if (startTask(id) != StartResult::Success) {
-                // Auto-start failed - delete the task and return -1.
-                // Error is already set by startTask(). Use autoStart=false to handle failures manually.
-                ArdaError savedError = error_;
-                deleteTask(id);
-                error_ = savedError;
-                return -1;
+        // Handle auto-start: if begin() called, start now; otherwise set bit for begin()
+        if (autoStart) {
+            if (flags_ & FLAG_BEGUN) {
+                if (startTask(id) != StartResult::Success) {
+                    // Auto-start failed - delete the task and return -1.
+                    // Error is already set by startTask(). Use autoStart=false to handle failures manually.
+                    ArdaError savedError = error_;
+                    deleteTask(id);
+                    error_ = savedError;
+                    return -1;
+                }
+            } else {
+                // begin() not called yet - set autoStart bit for begin() to pick up
+                tasks[id].flags |= ARDA_TASK_RAN_BIT;
             }
         }
+    }
+    return id;
+}
+#endif
+
+#if defined(ARDA_TASK_RECOVERY) && !defined(ARDA_NO_PRIORITY)
+int8_t Arda::createTask(const char* name, TaskCallback setup, TaskCallback loop,
+                        uint32_t intervalMs, TaskCallback teardown, bool autoStart,
+                        TaskPriority priority, uint32_t timeoutMs, TaskCallback recover) {
+    // Call the priority-based createTask first
+    int8_t id = createTask(name, setup, loop, intervalMs, teardown, autoStart, priority);
+    if (id >= 0) {
+        tasks[id].timeout = timeoutMs;
+        tasks[id].recover = recover;
     }
     return id;
 }
@@ -695,9 +1093,14 @@ bool Arda::deleteTask(int8_t taskId) {
     tasks[taskId].setup = nullptr;
     tasks[taskId].loop = nullptr;
     tasks[taskId].teardown = nullptr;
+#ifdef ARDA_TASK_RECOVERY
+    tasks[taskId].recover = nullptr;
+#endif
     tasks[taskId].lastRun = 0;
     // Note: runCount shares union with nextFree; freeSlot() will set nextFree
+#ifdef ARDA_TASK_RECOVERY
     tasks[taskId].timeout = 0;
+#endif
     // Reset flag bits; markDeleted already set the deleted state
 #ifdef ARDA_NO_NAMES
     tasks[taskId].flags = ARDA_TASK_DELETED_STATE;  // state=deleted, clear other bits
@@ -933,15 +1336,104 @@ bool Arda::setTaskInterval(int8_t taskId, uint32_t intervalMs, bool resetTiming)
     return true;
 }
 
+#ifdef ARDA_TASK_RECOVERY
 bool Arda::setTaskTimeout(int8_t taskId, uint32_t timeoutMs) {
     if (!isValidTask(taskId)) {
         error_ = ArdaError::InvalidId;
         return false;
     }
     tasks[taskId].timeout = timeoutMs;
+
+#if ARDA_TASK_RECOVERY_IMPL
+    // If this task is currently executing and recovery is armed, re-arm with new timeout.
+    // This allows tasks to extend/disable their timeout mid-loop for known-slow operations.
+    if (taskId == currentTask && recoveryArmed_) {
+        disarmRecoveryTimer();
+        if (timeoutMs > 0 && recoveryEnabled_) {
+            armRecoveryTimer(taskId, timeoutMs);
+        }
+    }
+#endif
+
     error_ = ArdaError::Ok;
     return true;
 }
+
+#if ARDA_TASK_RECOVERY_IMPL
+bool Arda::heartbeat() {
+    if (currentTask < 0) {
+        error_ = ArdaError::InvalidId;
+        return false;
+    }
+    uint32_t timeout = tasks[currentTask].timeout;
+    if (timeout == 0) {
+        error_ = ArdaError::WrongState;  // No timeout configured
+        return false;
+    }
+    if (recoveryArmed_) {
+        disarmRecoveryTimer();
+        armRecoveryTimer(currentTask, timeout);
+    }
+    error_ = ArdaError::Ok;
+    return true;
+}
+#endif
+
+bool Arda::setTaskRecover(int8_t taskId, TaskCallback recover) {
+#if ARDA_TASK_RECOVERY_IMPL
+    if (!isValidTask(taskId)) {
+        error_ = ArdaError::InvalidId;
+        return false;
+    }
+    tasks[taskId].recover = recover;
+    error_ = ArdaError::Ok;
+    return true;
+#else
+    (void)taskId; (void)recover;
+    error_ = ArdaError::NotSupported;
+    return false;  // Hardware doesn't support task recovery
+#endif
+}
+
+bool Arda::hasTaskRecover(int8_t taskId) const {
+#if ARDA_TASK_RECOVERY_IMPL
+    if (!isValidTask(taskId)) return false;
+    return tasks[taskId].recover != nullptr;
+#else
+    (void)taskId;
+    return false;
+#endif
+}
+
+bool Arda::setTaskRecoveryEnabled(bool enabled) {
+#if ARDA_TASK_RECOVERY_IMPL
+    uint8_t sreg = SREG;
+    cli();  // Atomic update
+
+    if (!enabled && recoveryArmed_) {
+        // Disabling while timer is armed - disarm it safely
+        // Order matches disarmRecoveryTimer() for consistency
+        recoveryArmed_ = false;
+        TCCR2B = 0;
+        TIMSK2 = 0;
+        TIFR2 = (1 << TOV2);
+        recoveryTask_ = -1;  // Clear for consistency with disarmRecoveryTimer()
+    }
+
+    recoveryEnabled_ = enabled;
+    SREG = sreg;
+#else
+    // Non-AVR: software flag only (no hardware abort to control)
+    recoveryEnabled_ = enabled;
+#endif
+    error_ = ArdaError::Ok;
+    return true;
+}
+
+bool Arda::isTaskRecoveryEnabled() const {
+    return recoveryEnabled_;
+}
+#endif
 
 #ifndef ARDA_NO_PRIORITY
 bool Arda::setTaskPriority(int8_t taskId, TaskPriority priority) {
@@ -1288,12 +1780,14 @@ uint32_t Arda::getTaskInterval(int8_t taskId) const {
     return tasks[taskId].interval;
 }
 
+#ifdef ARDA_TASK_RECOVERY
 uint32_t Arda::getTaskTimeout(int8_t taskId) const {
     if (!isValidTask(taskId)) {
         return 0;
     }
     return tasks[taskId].timeout;
 }
+#endif
 
 uint32_t Arda::getTaskLastRun(int8_t taskId) const {
     if (!isValidTask(taskId)) {
@@ -1373,9 +1867,11 @@ bool Arda::hasTaskTeardown(int8_t taskId) const {
 // Callback configuration
 // =============================================================================
 
+#ifdef ARDA_TASK_RECOVERY
 void Arda::setTimeoutCallback(TimeoutCallback callback) {
     timeoutCallback = callback;
 }
+#endif
 
 void Arda::setStartFailureCallback(StartFailureCallback callback) {
     startFailureCallback = callback;
@@ -1463,6 +1959,9 @@ const char* Arda::errorString(ArdaError error) {
         case ArdaError::InCallback:    return "InCallback";
         case ArdaError::NotSupported:  return "NotSupported";
         case ArdaError::InvalidValue:  return "InvalidValue";
+#ifdef ARDA_TASK_RECOVERY
+        case ArdaError::TaskAborted:   return "Aborted";
+#endif
         default:                       return "Unknown";
 #else
         case ArdaError::Ok:            return "No error";
@@ -1483,6 +1982,9 @@ const char* Arda::errorString(ArdaError error) {
         case ArdaError::InCallback:    return "Cannot call from callback";
         case ArdaError::NotSupported:  return "Not supported";
         case ArdaError::InvalidValue:  return "Value out of range";
+#ifdef ARDA_TASK_RECOVERY
+        case ArdaError::TaskAborted:   return "Task forcibly aborted (timeout)";
+#endif
         default:                       return "Unknown error";
 #endif
     }
@@ -1837,6 +2339,27 @@ void Arda::shellCmd_(uint8_t len) {
                 }
             }
             break;
+#ifdef ARDA_TASK_RECOVERY
+        case 't':  // Timeout: "t 1 100"
+            if (id < 0) { shellStream_->println(F("t <id> <ms>")); break; }
+            {
+                uint8_t j = 2;
+                while (j < len && shellBuf_[j] >= '0' && shellBuf_[j] <= '9') j++;
+                while (j < len && shellBuf_[j] == ' ') j++;
+                if (j >= len || shellBuf_[j] < '0' || shellBuf_[j] > '9') {
+                    shellStream_->println(F("t <id> <ms>"));
+                    break;
+                }
+                uint32_t ms = shellParseArg2_(len);
+                if (!setTaskTimeout(id, ms)) {
+                    shellStream_->print(F("ERR "));
+                    shellStream_->println(errorString(error_));
+                } else {
+                    shellStream_->println(F("OK"));
+                }
+            }
+            break;
+#endif
 #ifndef ARDA_NO_NAMES
         case 'n':  // Rename: "n 1 newname"
             if (id < 0) { shellStream_->println(F("n <id> <name>")); break; }
@@ -1919,6 +2442,9 @@ void Arda::shellCmd_(uint8_t len) {
             shellStream_->println(F("i info"));
             shellStream_->println(F("w when"));
             shellStream_->println(F("a interval"));
+#ifdef ARDA_TASK_RECOVERY
+            shellStream_->println(F("t timeout"));
+#endif
 #ifndef ARDA_NO_PRIORITY
             shellStream_->println(F("y priority"));
 #endif
@@ -1955,6 +2481,9 @@ void Arda::shellCmd_(uint8_t len) {
             shellStream_->println(F("i <id>        task info"));
             shellStream_->println(F("w <id>        when (timing info)"));
             shellStream_->println(F("a <id> <ms>   adjust interval"));
+#ifdef ARDA_TASK_RECOVERY
+            shellStream_->println(F("t <id> <ms>   set timeout"));
+#endif
 #ifndef ARDA_NO_PRIORITY
             shellStream_->println(F("y <id> <pri>  set priority"));
 #endif
@@ -2013,11 +2542,13 @@ void Arda::shellInfo_(int8_t id) {
     shellStream_->print(F(" pri:"));
     shellStream_->print(static_cast<uint8_t>(getTaskPriority(id)));
 #endif
+#ifdef ARDA_TASK_RECOVERY
     uint32_t to = getTaskTimeout(id);
     if (to > 0) {
         shellStream_->print(F(" timeout:"));
         shellStream_->print(to);
     }
+#endif
     shellStream_->println();
 }
 

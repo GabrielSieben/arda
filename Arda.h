@@ -13,9 +13,9 @@
 
 // Version info
 #define ARDA_VERSION_MAJOR 1
-#define ARDA_VERSION_MINOR 1
-#define ARDA_VERSION_PATCH 2
-#define ARDA_VERSION_STRING "1.1.2"
+#define ARDA_VERSION_MINOR 2
+#define ARDA_VERSION_PATCH 0
+#define ARDA_VERSION_STRING "1.2.0"
 
 // Configuration constants - adjust these to tune memory usage vs capability
 #ifndef ARDA_MAX_TASKS
@@ -35,7 +35,7 @@
 #error "ARDA_MAX_CALLBACK_DEPTH must be at least 1"
 #endif
 
-// Optional features - define before including Arda.h to enable
+// Optional features - define before including Arda.h to enable/disable
 // #define ARDA_CASE_INSENSITIVE_NAMES  // Make findTaskByName case-insensitive
 // #define ARDA_NO_GLOBAL_INSTANCE      // Don't create global 'OS' instance (create your own)
 // #define ARDA_NO_PRIORITY             // Disable priority scheduling (saves code size, uses array-order execution)
@@ -43,7 +43,8 @@
 // #define ARDA_NO_SHELL                // Disable built-in shell task entirely
 // #define ARDA_SHELL_MANUAL_START      // Don't auto-start shell in begin()
 // #define ARDA_SHELL_MINIMAL           // Only core commands (p/r/s/t/d/l/h)
-// #define ARDA_NO_WATCHDOG             // Disable hardware watchdog (AVR only, auto-enabled by default)
+// #define ARDA_NO_TASK_RECOVERY        // Disable soft watchdog (AVR only, auto-enabled by default)
+// #define ARDA_WATCHDOG                // Enable hardware watchdog (AVR only, opt-in, resets entire MCU)
 // #define ARDA_YIELD                   // Enable yield() - USE WITH CAUTION (see README)
 
 // Shell is only active when enabled AND global instance exists
@@ -60,6 +61,36 @@
 #if defined(__AVR__) && defined(ARDA_WATCHDOG)
 #include <avr/wdt.h>
 #endif
+
+// Task recovery (soft watchdog) - enabled by default on all platforms
+// Provides timeout tracking and callbacks. On AVR with Timer2, also provides
+// hardware abort via setjmp/longjmp to forcibly stop stuck tasks.
+// Disable with: #define ARDA_NO_TASK_RECOVERY before including Arda.h
+#if !defined(ARDA_NO_TASK_RECOVERY) && !defined(ARDA_TASK_RECOVERY)
+  #define ARDA_TASK_RECOVERY 1
+#endif
+
+#ifdef ARDA_TASK_RECOVERY
+
+// Hardware capability detection - sets ARDA_TASK_RECOVERY_IMPL
+// API always exists, but isTaskRecoveryAvailable() returns false without hardware support
+#if defined(__AVR__) && defined(TCCR2A) && defined(TCCR2B) && defined(TIMSK2) && defined(F_CPU)
+  // AVR with Timer2 - check for conflicting features before enabling hardware impl
+  #if defined(ARDA_YIELD)
+    #error "ARDA_TASK_RECOVERY hardware abort and ARDA_YIELD cannot both be used (yield corrupts jump context)"
+  #endif
+  #if defined(ARDA_NO_GLOBAL_INSTANCE)
+    #error "ARDA_TASK_RECOVERY hardware abort requires global OS instance (Timer2 ISR is global)"
+  #endif
+  #define ARDA_TASK_RECOVERY_IMPL 1
+  #include <setjmp.h>
+  #include <avr/interrupt.h>
+#else
+  // Non-AVR or AVR without Timer2: API exists but no hardware abort
+  #define ARDA_TASK_RECOVERY_IMPL 0
+#endif
+
+#endif // ARDA_TASK_RECOVERY
 
 typedef void (*TaskCallback)(void);
 
@@ -93,7 +124,8 @@ enum class ArdaError : uint8_t {
     StateChanged,        // Callback modified task state unexpectedly
     InCallback,          // Cannot call reset() from within a callback
     NotSupported,        // Feature disabled at compile time (e.g., names when ARDA_NO_NAMES)
-    InvalidValue         // Parameter value out of valid range (e.g., priority > Highest)
+    InvalidValue,        // Parameter value out of valid range (e.g., priority > Highest)
+    TaskAborted          // Task was forcibly aborted due to timeout (ARDA_TASK_RECOVERY)
 };
 
 // Result codes for startTask() - disambiguates success from partial success
@@ -112,7 +144,9 @@ enum class StopResult : uint8_t {
 };
 
 // Callback types for event notifications
+#ifdef ARDA_TASK_RECOVERY
 typedef void (*TimeoutCallback)(int8_t taskId, uint32_t actualDurationMs);
+#endif
 typedef void (*StartFailureCallback)(int8_t taskId, ArdaError error);
 
 // Debug/trace events for monitoring task lifecycle (9 events).
@@ -127,7 +161,10 @@ enum class TraceEvent : uint8_t {
     TaskStopped,    // Task is now Stopped (teardown completed or skipped)
     TaskPaused,     // Task state changed to Paused (no callback, so no "TaskPausing")
     TaskResumed,    // Task state changed to Running (no callback, so no "TaskResuming")
-    TaskDeleted     // Task was deleted (already invalidated, ID only)
+    TaskDeleted,    // Task was deleted (already invalidated, ID only)
+    // New events added at end for ABI stability:
+    TaskAborted,    // Task loop() was force-aborted (ARDA_TASK_RECOVERY only)
+    RecoverAborted  // Task recover() was also force-aborted (ARDA_TASK_RECOVERY only)
 };
 typedef void (*TraceCallback)(int8_t taskId, TraceEvent event);
 
@@ -161,12 +198,9 @@ enum class TaskPriority : uint8_t {
 #endif
 
 // Task structure - fields ordered to minimize padding.
-// Memory per task (with default ARDA_MAX_NAME_LEN=16):
-//   AVR (8-bit):  16 + 3*2 + 4*4 + 1 = ~39 bytes (23 bytes with ARDA_NO_NAMES)
-//   ESP8266/32:   16 + 3*4 + 4*4 + 1 = ~45 bytes (29 bytes with ARDA_NO_NAMES)
-//   32-bit ARM:   16 + 3*4 + 4*4 + 1 = ~45 bytes (29 bytes with ARDA_NO_NAMES)
-//   64-bit:       16 + 3*8 + 4*4 + 1 + padding = ~57 bytes (41 bytes with ARDA_NO_NAMES)
-// Total for 16 tasks: ~624 bytes (AVR), ~720 bytes (32-bit), ~912 bytes (64-bit)
+// Memory per task (with ARDA_TASK_RECOVERY enabled, ARDA_MAX_NAME_LEN=16):
+//   AVR (8-bit):  16 + 4*2 + 3*4 + 4 + 1 = ~41 bytes (25 bytes with ARDA_NO_NAMES)
+// Total for 16 tasks on AVR: ~656 bytes (400 bytes with ARDA_NO_NAMES)
 struct Task {
 #ifndef ARDA_NO_NAMES
     char name[ARDA_MAX_NAME_LEN]; // Copied, safe from dangling pointers; empty = deleted
@@ -174,9 +208,14 @@ struct Task {
     TaskCallback setup;           // One-time initialization callback
     TaskCallback loop;            // Repeated execution callback
     TaskCallback teardown;        // Cleanup callback (called on stop)
+#ifdef ARDA_TASK_RECOVERY
+    TaskCallback recover;         // Called after forced abort (can be nullptr)
+#endif
     uint32_t interval;            // Run interval in ms (0 = every cycle)
     uint32_t lastRun;             // Actual execution time (for scheduling and getTaskLastRun)
+#ifdef ARDA_TASK_RECOVERY
     uint32_t timeout;             // Max execution time in ms (0 = disabled)
+#endif
     // INVARIANT: This union shares memory between active and deleted task states.
     // - runCount: ONLY valid when task is not deleted. Read via getTaskRunCount().
     // - nextFree: ONLY valid when task is deleted. Used internally for free list.
@@ -282,6 +321,15 @@ public:
                       bool autoStart, TaskPriority priority);
 #endif
 
+#if defined(ARDA_TASK_RECOVERY) && !defined(ARDA_NO_PRIORITY)
+    // Create a task with timeout and recovery callback.
+    // timeoutMs: max execution time (0 = disabled)
+    // recover: called after forced timeout abort (can be nullptr)
+    int8_t createTask(const char* name, TaskCallback setup, TaskCallback loop,
+                      uint32_t intervalMs, TaskCallback teardown, bool autoStart,
+                      TaskPriority priority, uint32_t timeoutMs, TaskCallback recover);
+#endif
+
     bool deleteTask(int8_t taskId);
 
     // Stop and delete a task in one operation. Handles already-stopped tasks gracefully.
@@ -325,7 +373,30 @@ public:
     // Set resetTiming=true to reset lastRun to now (task waits full new interval from now).
     bool setTaskInterval(int8_t taskId, uint32_t intervalMs, bool resetTiming = false);
 
+#ifdef ARDA_TASK_RECOVERY
     bool setTaskTimeout(int8_t taskId, uint32_t timeoutMs);  // 0 = disabled
+    // Set recovery callback for a task (called after forced timeout abort)
+    bool setTaskRecover(int8_t taskId, TaskCallback recover);
+
+#if ARDA_TASK_RECOVERY_IMPL
+    // Reset current task's timeout timer to its configured value.
+    // Useful for long-running tasks that want to signal progress.
+    // Returns false if called outside task context or task has no timeout.
+    bool heartbeat();
+#endif
+
+    // Check if a task has a recovery callback
+    bool hasTaskRecover(int8_t taskId) const;
+
+    // Enable/disable task recovery globally
+    // When disabled, tasks run without timeout protection even if timeout is set
+    // Returns true if successful, false if hardware doesn't support task recovery
+    bool setTaskRecoveryEnabled(bool enabled);
+
+    // Check if task recovery is currently enabled AND available
+    // Returns false if hardware doesn't support it OR if disabled via setTaskRecoveryEnabled()
+    bool isTaskRecoveryEnabled() const;
+#endif
 
 #ifndef ARDA_NO_PRIORITY
     // Set task priority (higher = runs first). Returns false with InvalidValue if out of range.
@@ -366,15 +437,37 @@ public:
     int8_t getSlotCount() const;        // Total slots used (including deleted) - for iteration
     static constexpr int8_t getMaxTasks() { return ARDA_MAX_TASKS; }  // Maximum task capacity
 
+    // Feature availability queries (compile-time constants, useful for conditional code)
+    // These methods always exist - return whether the feature is compiled in and functional
+    static constexpr bool isTaskRecoveryAvailable() {
+#ifdef ARDA_TASK_RECOVERY
+        // Returns true only if hardware supports task recovery (AVR with Timer2)
+        // This is a compile-time constant, but presented as runtime API for portability
+        return ARDA_TASK_RECOVERY_IMPL != 0;
+#else
+        return false;
+#endif
+    }
+
+    static constexpr bool isWatchdogEnabled() {
+#ifdef ARDA_WATCHDOG
+        return true;
+#else
+        return false;
+#endif
+    }
+
     const char* getTaskName(int8_t taskId) const;  // Returns nullptr if invalid
     TaskState getTaskState(int8_t taskId) const;   // Returns TaskState::Invalid if invalid
 
     // NOTE: These getters return 0 for invalid tasks, but 0 is also a valid value
-    // (runCount=0 means not yet run, interval=0 means every cycle, timeout=0 means disabled).
+    // (runCount=0 means not yet run, interval=0 means every cycle).
     // Call isValidTask() first if you need to distinguish invalid from zero.
     uint32_t getTaskRunCount(int8_t taskId) const;  // Runs since last start (reset on each startTask)
     uint32_t getTaskInterval(int8_t taskId) const;
+#ifdef ARDA_TASK_RECOVERY
     uint32_t getTaskTimeout(int8_t taskId) const;
+#endif
     uint32_t getTaskLastRun(int8_t taskId) const;   // millis() snapshot when task last ran (0 if never ran or invalid)
 
     int8_t getCurrentTask() const;          // Returns ID of currently executing task, or -1
@@ -404,8 +497,10 @@ public:
     // Callback configuration
     // -------------------------------------------------------------------------
 
+#ifdef ARDA_TASK_RECOVERY
     // Set callback invoked when a task exceeds its timeout (called after task returns)
     void setTimeoutCallback(TimeoutCallback callback);
+#endif
 
     // Set callback invoked for each task that fails to start during begin()
     void setStartFailureCallback(StartFailureCallback callback);
@@ -451,6 +546,22 @@ public:
 #endif
 #endif
 
+#ifdef ARDA_TASK_RECOVERY
+#if ARDA_TASK_RECOVERY_IMPL
+    // -------------------------------------------------------------------------
+    // Task Recovery (soft watchdog) - public static for ISR access
+    // -------------------------------------------------------------------------
+    // WARNING: These are public only for Timer2 ISR access. Do not use directly.
+    static jmp_buf recoveryJumpBuf_;
+    static volatile int8_t recoveryTask_;               // Currently monitored task (for debugging)
+    static volatile bool recoveryFired_;                // Set by ISR (for debugging)
+    static volatile uint16_t recoveryOverflowsRemaining_;
+    static volatile bool recoveryInCallback_;           // True if in recover() callback
+    static volatile bool recoveryArmed_;                // Guard against spurious ISR
+    static volatile bool recoveryEnabled_;              // Global enable flag (default: true)
+#endif
+#endif
+
 private:
     // Scheduler flags bit positions
     static constexpr uint8_t FLAG_BEGUN    = 0x01;  // bit 0: begin() has been called
@@ -468,7 +579,12 @@ private:
     ArdaError error_;        // Error code from most recent failed operation
 
     // User callbacks
+#ifdef ARDA_TASK_RECOVERY
     TimeoutCallback timeoutCallback;            // Called when task exceeds timeout
+#if !ARDA_TASK_RECOVERY_IMPL
+    bool recoveryEnabled_;                      // Software flag for non-AVR platforms (default: true)
+#endif
+#endif
     StartFailureCallback startFailureCallback;  // Called when task fails to start in begin()
     TraceCallback traceCallback;                // Called for debug/trace events
 
@@ -481,6 +597,14 @@ private:
 
     // Case-insensitive string comparison helper (only used if ARDA_CASE_INSENSITIVE_NAMES defined)
     static bool nameEquals(const char* a, const char* b);
+
+#ifdef ARDA_TASK_RECOVERY
+#if ARDA_TASK_RECOVERY_IMPL
+    void initTaskRecovery();                              // Initialize Timer2 for task recovery
+    void armRecoveryTimer(int8_t taskId, uint32_t timeoutMs);  // Arm recovery timer
+    void disarmRecoveryTimer();                           // Disarm recovery timer
+#endif
+#endif
 
 #ifdef ARDA_SHELL_ACTIVE
     Stream* shellStream_;

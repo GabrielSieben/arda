@@ -17,6 +17,10 @@ MockSerial Serial;
 // Disable priority and shell BEFORE including Arda
 #define ARDA_NO_PRIORITY
 #define ARDA_NO_SHELL
+
+// Enable task recovery feature for timeout tests (not auto-enabled on non-AVR)
+#define ARDA_TASK_RECOVERY 1
+
 #include "../Arda.h"
 #include "../Arda.cpp"
 

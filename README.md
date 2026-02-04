@@ -1,37 +1,74 @@
 # Arda
 
-A cooperative multitasking scheduler for Arduino that allows multiple tasks to run "simultaneously".
-Designed with AVR-class boards (e.g., ATmega328, 2KB RAM) in mind, with a focus on memory efficiency.
+A cooperative multitasking scheduler for Arduino, built specifically for AVR microcontrollers (e.g., ATmega328, ATmega2560). Designed for memory-constrained environments with only 2KB RAM, where every byte counts.
+
+While Arda compiles on other Arduino-compatible platforms, it is optimized for and tested primarily on AVR.
+
+## Why Arda?
+
+### Task Recovery (AVR) — Hard Abort
+
+In cooperative multitasking, a single misbehaving task can freeze your entire system. If a task's `loop()` never returns (whether due to a bug, an unresponsive sensor, or an unexpected infinite loop), every other task starves. Traditional solutions either reset the entire MCU (losing all state) or just hope your code is perfect.
+
+On AVR with Timer2, Arda is capable of **hard aborts**: forcibly terminating a stuck task without resetting the MCU. No other Arduino scheduler I'm aware of can do this. On a tiny 8-bit MCU with 2KB of RAM, that's basically black magic — a taste of preemptive multitasking where it shouldn't exist.
+
+When a task exceeds its timeout, Timer2 fires and uses `setjmp`/`longjmp` to jump back to the scheduler. The current `loop()` is aborted, an optional recovery callback runs for cleanup, and the scheduler continues. The task remains Running and will retry next cycle (or the recovery callback can stop it). No reset, no lost state, no frozen system. Even if you don't need multitasking, self-recovering sketches is a neat enough trick.
+
+Example:
+
+```cpp
+void sensor_setup() { /* init sensor */ }
+void sensor_loop()  { /* may hang if sensor stops responding */ }
+void sensor_recover() { /* reset sensor, clear state */ }
+
+void setup() {
+    int8_t id = OS.createTask("sensor", sensor_setup, sensor_loop, 0);
+    OS.setTaskTimeout(id, 50);          // 50 ms max execution time
+    OS.setTaskRecover(id, sensor_recover);
+    OS.begin();
+}
+
+void loop() { OS.run(); }
+```
+
+### Built-in Shell
+
+Arda includes a serial shell that lets you **control tasks at runtime** without writing any extra code. Connect via Serial Monitor and type commands to pause, resume, stop, or inspect any task. Useful for debugging, testing, and runtime diagnostics.
+
+```
+> l
+0 R sh
+1 R blinker
+2 P sensor
+
+> r 2
+OK
+```
+
+Arda also supports **priority scheduling**: critical tasks run before less important ones when both are ready.
 
 ## Features
 
-- Cooperative multitasking with configurable intervals
-- Task lifecycle management (start, pause, resume, stop)
+- Task recovery with configurable timeouts (hardware abort on AVR)
+- Built-in serial shell for runtime control
+- Priority scheduling (5 levels)
+- Task lifecycle: setup, loop, teardown, recover callbacks
 - Dynamic interval adjustment at runtime
-- Task lookup by name
-- Built-in serial shell for runtime task control (pause, resume, stop tasks via Serial)
-- Lightweight - minimal memory footprint
-- Works on all Arduino boards
+- Batch operations (start/stop/pause multiple tasks)
+- Detailed error codes (`ArdaError` enum)
+- Trace callbacks for debugging
+- Optimized for 2KB RAM
 
 ## Quick Start
 
 ```cpp
 #include "Arda.h"
 
-void blinker_setup() {
-    pinMode(LED_BUILTIN, OUTPUT);
-}
-
-void blinker_loop() {
-    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-}
+void blinker_setup() { pinMode(LED_BUILTIN, OUTPUT); }
+void blinker_loop()  { digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); }
 
 void setup() {
-    int8_t blinkerId = OS.createTask("blinker", blinker_setup, blinker_loop, 500);
-    if (blinkerId == -1) {
-        // Handle error - task creation failed
-        while (1) { }
-    }
+    OS.createTask("blinker", blinker_setup, blinker_loop, 500);
     OS.begin();
 }
 
@@ -140,15 +177,20 @@ Key points:
 
 | Method | Description |
 |--------|-------------|
-| `createTask(name, setup, loop, interval, teardown, autoStart)` | Register a new task. Returns task ID (-1 on failure). Name must be non-empty, max 15 chars, and is **case-sensitive**. If `begin()` was called and `autoStart` is true (default), task auto-starts immediately; on start failure, task is deleted and -1 is returned (check `getError()`). Set `autoStart=false` to create in STOPPED state and handle start failures manually. When `ARDA_NO_NAMES` is defined, name is ignored; use the nameless `createTask(setup, loop, interval, teardown, autoStart)` overload instead. **Warning:** `interval=0` with high priority will starve all lower-priority tasks—ensure such tasks return quickly. |
+| `createTask(name, setup, loop, interval, teardown, autoStart)` | Register a new task. Returns task ID (-1 on failure). Name must be non-empty, max 15 chars, and is **case-sensitive**. If `begin()` was called and `autoStart` is true (default), task auto-starts immediately; on start failure, task is deleted and -1 is returned (check `getError()`). Set `autoStart=false` to create in STOPPED state and handle start failures manually. When `ARDA_NO_NAMES` is defined, name is ignored; use the nameless `createTask(setup, loop, interval, teardown, autoStart)` overload instead. **Warning:** `interval=0` with high priority will starve all lower-priority tasks, so ensure such tasks return quickly. |
 | `deleteTask(id)` | Delete a stopped task, freeing its slot for reuse. Cannot delete currently executing task. |
 | `killTask(id)` | Stop and delete a task in one call. Convenience for `stopTask(id)` then `deleteTask(id)`. Returns false if stop fails or teardown changes state (task remains in whatever state teardown left it). |
 | `startTask(id, runImmediately)` | Start a stopped task (runs setup callback). Returns `StartResult` enum - see below. Set `runImmediately=true` to skip the initial interval wait for interval-based tasks; `false` (default) waits one full interval. Note: Tasks started during a run() cycle run on the next cycle regardless of this flag. Resets `runCount` to 0. |
 | `pauseTask(id)` | Pause a running task |
 | `resumeTask(id)` | Resume a paused task |
 | `stopTask(id)` | Stop a task (runs teardown if provided). Returns `StopResult` enum - see below. |
-| `setTaskTimeout(id, ms)` | Set max execution time for a task (0 = disabled). If exceeded, timeout callback is called. |
-| `getTaskTimeout(id)` | Get a task's timeout setting (0 if disabled or invalid task) |
+| `setTaskTimeout(id, ms)` | Set max execution time for a task (0 = disabled). Requires `ARDA_TASK_RECOVERY`. On soft platforms: timeout callback fires after task returns. On AVR with Timer2: task is forcibly aborted (timeout callback is skipped; trace events and recover() run instead). |
+| `getTaskTimeout(id)` | Get a task's timeout setting (0 if disabled or invalid task). Requires `ARDA_TASK_RECOVERY`. |
+| `heartbeat()` | Reset the current task's timeout timer to its configured value. Useful for long-running tasks that want to signal progress without changing their timeout setting. Returns false if called outside task context or task has no timeout configured. **AVR only** (requires hardware timer support). |
+| `setTaskRecover(id, cb)` | Set recovery callback for a task (called after forced timeout abort). Requires `ARDA_TASK_RECOVERY` and hardware support (AVR with Timer2); returns false with `NotSupported` on other platforms. |
+| `hasTaskRecover(id)` | Check if a task has a recovery callback. Requires `ARDA_TASK_RECOVERY` and hardware support; returns false on other platforms. |
+| `setTaskRecoveryEnabled(enabled)` | Enable/disable task recovery globally at runtime. Returns false if hardware doesn't support it. Requires `ARDA_TASK_RECOVERY`. |
+| `isTaskRecoveryEnabled()` | Check if task recovery is currently enabled AND available. Requires `ARDA_TASK_RECOVERY`. |
 | `setTaskPriority(id, priority)` | Set task priority (`TaskPriority` enum). Returns false with `InvalidValue` if invalid. Not available if `ARDA_NO_PRIORITY` is defined. |
 | `getTaskPriority(id)` | Get task priority. Returns `TaskPriority::Lowest` for invalid tasks. Not available if `ARDA_NO_PRIORITY` is defined. |
 | `setTaskInterval(id, ms, resetTiming)` | Change a task's execution interval at runtime. By default (`resetTiming=false`), keeps existing timing (next run based on lastRun + new interval). Set `resetTiming=true` to reset timing so task waits the full new interval from now. |
@@ -234,11 +276,11 @@ switch (result) {
 |--------|-------------|
 | `begin()` | Initialize scheduler and start all registered tasks. Returns number successfully started, or -1 if already begun. Use `createTask(..., autoStart=false)` for tasks that should start in Stopped state. |
 | `run()` | Execute the scheduler (call in loop()). Returns false with `WrongState` error if `begin()` not called. |
-| `reset(preserveCallbacks)` | Stop all tasks and reset scheduler to initial state. You must call `begin()` again after reset to restart the scheduler. By default clears user callbacks (timeout, startFailure, trace); set `preserveCallbacks=true` to keep them. Returns true if all teardowns ran, false if any were skipped (check `getError()`). |
-| `yield()` | Give other tasks a chance to run. **Requires `ARDA_YIELD`.** **Discouraged**—see [Appendix: yield()](#appendix-yield). |
+| `reset(preserveCallbacks)` | Stop all tasks and reset scheduler to initial state. You must call `begin()` again after reset to restart the scheduler. By default clears user callbacks (timeout, startFailure, trace); set `preserveCallbacks=true` to keep them. Returns true if all stops succeeded, false if any stop failed or teardown was skipped/changed state (check `getError()`). |
+| `yield()` | Give other tasks a chance to run. **Requires `ARDA_YIELD`.** **Discouraged.** See [Appendix: yield()](#appendix-yield). |
 | `uptime()` | Milliseconds since begin(), or 0 if begin() not yet called |
 | `hasBegun()` | Returns true if begin() has been called |
-| `setTimeoutCallback(cb)` | Set callback invoked when a task exceeds its timeout |
+| `setTimeoutCallback(cb)` | Set callback invoked when a task exceeds its timeout. Requires `ARDA_TASK_RECOVERY`. |
 | `setStartFailureCallback(cb)` | Set callback invoked for each task that fails to start during `begin()` |
 | `setTraceCallback(cb)` | Set callback for debugging/tracing task execution (nullptr to disable) |
 | `setShellStream(stream)` | Set Stream for shell I/O (default: Serial). See [Built-in Shell](#built-in-shell). |
@@ -269,6 +311,8 @@ switch (result) {
 | `hasTaskSetup(id)` | Returns true if task has a setup callback configured |
 | `hasTaskLoop(id)` | Returns true if task has a loop callback configured |
 | `hasTaskTeardown(id)` | Returns true if task has a teardown callback configured |
+| `isTaskRecoveryAvailable()` | Static. Returns true if hardware supports task recovery (compile-time constant). |
+| `isWatchdogEnabled()` | Static. Returns true if `ARDA_WATCHDOG` is defined (compile-time constant). |
 
 > **Warning: Task Iteration**
 > Do NOT use `getTaskCount()` as the loop bound when iterating by index. Deleted tasks leave gaps, so valid tasks may exist at indices beyond `getTaskCount()`. Use `getSlotCount()` with `isValidTask()` instead:
@@ -359,7 +403,7 @@ void setup() {
 - Use this for debugging and monitoring, not for hard real-time guarantees
 - On cooperative systems, a truly blocking task will still hang the scheduler
 
-**Why can't timeouts interrupt blocking tasks?** Arda is a cooperative scheduler with no preemption mechanism. Timeouts are checked *after* each task's `loop()` returns—there's no way to interrupt a task mid-execution without hardware timer interrupts and setjmp/longjmp, which would add significant complexity and memory overhead. Think of task timeouts as "soft monitoring" for tasks that eventually return but took too long, not as a hard deadline enforcer.
+On AVR with Timer2, timeouts *can* interrupt blocking tasks. Task recovery uses hardware timer interrupts and `setjmp`/`longjmp` to forcibly abort stuck tasks. On other platforms, timeouts are "soft": checked after `loop()` returns, useful for monitoring but not enforcement.
 
 ### Debug/Trace Callback
 
@@ -369,11 +413,14 @@ Monitor task execution for debugging:
 void onTrace(int8_t taskId, TraceEvent event) {
     const char* eventNames[] = {
         "STARTING", "STARTED", "LOOP_BEGIN", "LOOP_END",
-        "STOPPING", "STOPPED", "PAUSED", "RESUMED", "DELETED"
+        "STOPPING", "STOPPED", "PAUSED", "RESUMED", "DELETED",
+        "ABORTED", "RECOVER_ABORTED"  // ARDA_TASK_RECOVERY only
     };
+    uint8_t idx = static_cast<uint8_t>(event);
+    if (idx >= sizeof(eventNames)/sizeof(eventNames[0])) return;  // Guard
     Serial.print(OS.getTaskName(taskId));
     Serial.print(F(": "));
-    Serial.println(eventNames[static_cast<uint8_t>(event)]);
+    Serial.println(eventNames[idx]);
 }
 
 void setup() {
@@ -393,12 +440,14 @@ Trace events:
 - `TraceEvent::TaskPaused` - Task state changed to Paused
 - `TraceEvent::TaskResumed` - Task state changed to Running
 - `TraceEvent::TaskDeleted` - Task was deleted (already invalidated; callback receives ID only)
+- `TraceEvent::TaskAborted` - Task loop() was force-aborted due to timeout (AVR with Timer2 only)
+- `TraceEvent::RecoverAborted` - Task recover() was also force-aborted (AVR with Timer2 only)
 
 > **Note:** The "ing" variants (`TaskStarting`, `TaskStopping`, `TaskLoopBegin`) bracket user callbacks - they fire *before* your code runs. Pause/resume have no callbacks to bracket, so only "ed" variants exist.
 
 Set callback to `nullptr` to disable tracing (recommended for production).
 
-**Note:** When `ARDA_NO_NAMES` is defined, `getTaskName(taskId)` returns nullptr. Use the numeric task ID for identification in trace output instead.
+When `ARDA_NO_NAMES` is defined, `getTaskName(taskId)` returns nullptr. Use the numeric task ID for identification in trace output instead.
 
 ### Start Failure Callback
 
@@ -445,10 +494,10 @@ Arda includes a built-in serial shell task (at ID 0) for runtime task management
 | `i <id>` | Task info (interval, runs, priority, timeout) |
 | `w <id>` | When: shows time since last run and next due (or `[P]`/`[S]` if paused/stopped) |
 | `a <id> <ms>` | Adjust interval (set new interval in milliseconds) |
+| `t <id> <ms>` | Set timeout (requires `ARDA_TASK_RECOVERY`) |
 | `y <id> <pri>` | Set priority 0-4 (not available with `ARDA_NO_PRIORITY`) |
 | `n <id> <name>` | Rename task (not available with `ARDA_NO_NAMES`) |
 | `g <id>` | Go: begin task with immediate execution (like `startTask(id, true)`) |
-| `l` | List all tasks |
 | `e` | Last error code and message |
 | `c` | Clear error (resets `getError()` to `ArdaError::Ok`) |
 | `m` | Memory info (task count, max tasks, slots used) |
@@ -469,8 +518,8 @@ Arda includes a built-in serial shell task (at ID 0) for runtime task management
 ```
 
 ```cpp
-// Minimal shell - only core commands (p/r/s/t/d/l/h), saves ~200 bytes
-// Removes debug commands: i, u, m, e, v
+// Minimal shell - only core commands (b/s/p/r/k/d/l/h), saves ~200 bytes
+// Removes extended commands: i, w, a, y, n, g, e, c, m, u, v, o
 #define ARDA_SHELL_MINIMAL
 #include "Arda.h"
 ```
@@ -625,7 +674,7 @@ if (OS.isValidTask(taskId)) {
 
 ## Macros (Optional)
 
-Arda provides optional macros to reduce boilerplate. You can also use plain functions and `createTask()` directly—the macros just auto-generate function names to avoid repetition.
+Arda provides optional macros to reduce boilerplate. You can also use plain functions and `createTask()` directly; the macros just auto-generate function names to avoid repetition.
 
 **Without macros (recommended for clarity):**
 ```cpp
@@ -685,9 +734,7 @@ Tasks with intervals guarantee a minimum gap between executions. If a task with 
 
 If the scheduler falls behind (e.g., due to a long-running task), it does not run multiple catch-up iterations.
 
-**Example:** A task with 100ms interval last ran at t=100. If the next `run()` call happens at t=350, the task runs once and `lastRun` is set to t=350. The next execution will be at t=450 or later.
-
-**Implication:** If you need strict periodicity, implement your own timing logic using `millis()` inside the task.
+A task with 100ms interval last ran at t=100. If the next `run()` call happens at t=350, the task runs once and `lastRun` is set to t=350. The next execution will be at t=450 or later. If you need strict periodicity, implement your own timing logic using `millis()` inside the task.
 
 ### millis() Overflow
 
@@ -695,7 +742,7 @@ Arduino's `millis()` overflows after ~49 days. Arda handles this correctly - int
 
 ### Run Count Overflow
 
-`getTaskRunCount()` returns a `uint32_t` that increments on each `loop()` execution. **Note:** This counter resets to 0 on each `startTask()` call, so it tracks runs since the most recent start, not lifetime executions. At 1ms intervals, this overflows after ~49 days. If you need cumulative execution counts across restarts, maintain your own counter.
+`getTaskRunCount()` returns a `uint32_t` that increments on each `loop()` execution. This counter resets to 0 on each `startTask()` call, so it tracks runs since the most recent start, not lifetime executions. At 1ms intervals, this overflows after ~49 days. If you need cumulative execution counts across restarts, maintain your own counter.
 
 ### Callback Depth Limit
 
@@ -737,7 +784,7 @@ OS.createTask("MyTask", ...);
 OS.findTaskByName("mytask");  // Returns the task ID (matches "MyTask")
 ```
 
-**Note:** Case-insensitive matching only handles ASCII letters (A-Z, a-z). Extended ASCII and UTF-8 characters are compared as-is.
+Case-insensitive matching only handles ASCII letters (A-Z, a-z). Extended ASCII and UTF-8 characters are compared as-is.
 
 ```cpp
 // Disable global OS instance (create your own scheduler instances)
@@ -783,6 +830,13 @@ Arda scheduler2;  // Multiple independent schedulers
 #include "Arda.h"
 ```
 
+```cpp
+// Disable task recovery (soft watchdog) - saves ~200 bytes on AVR
+// Task recovery is enabled by default on all platforms
+#define ARDA_NO_TASK_RECOVERY
+#include "Arda.h"
+```
+
 ### Combining Configuration Options
 
 For maximum memory savings on extremely constrained devices (e.g., ATtiny), combine multiple options:
@@ -792,6 +846,7 @@ For maximum memory savings on extremely constrained devices (e.g., ATtiny), comb
 #define ARDA_NO_NAMES
 #define ARDA_NO_PRIORITY
 #define ARDA_NO_SHELL
+#define ARDA_NO_TASK_RECOVERY
 #define ARDA_SHORT_MESSAGES
 #include "Arda.h"
 ```
@@ -800,30 +855,31 @@ This configuration saves:
 - 16 bytes per task from disabling names (default `ARDA_MAX_NAME_LEN`)
 - ~100-200 bytes of code from disabling priority
 - ~600 bytes flash + ~50 bytes RAM from disabling shell
+- ~200 bytes flash from disabling task recovery
 - ~200 bytes flash from short error strings
 - Reduced task array size from fewer max tasks
 
 ## Memory
 
-Memory usage per task (with default `ARDA_MAX_NAME_LEN=16`):
+Memory usage per task on AVR (with default `ARDA_MAX_NAME_LEN=16`):
 
-| Platform | With Names | With `ARDA_NO_NAMES` | 16 Tasks (default) | 16 Tasks (no names) |
-|----------|------------|----------------------|--------------------|--------------------|
-| **AVR (ATmega328)** | ~46 bytes | ~30 bytes | ~736 bytes | ~480 bytes |
-| **ESP8266/ESP32** | ~52 bytes | ~36 bytes | ~832 bytes | ~576 bytes |
-| **ARM Cortex-M** | ~52 bytes | ~36 bytes | ~832 bytes | ~576 bytes |
-| **64-bit (testing)** | ~64 bytes | ~48 bytes | ~1024 bytes | ~768 bytes |
+| Configuration | Per Task | 16 Tasks | 8 Tasks |
+|---------------|----------|----------|---------|
+| Default | ~41 bytes | ~656 bytes | ~328 bytes |
+| With `ARDA_NO_NAMES` | ~25 bytes | ~400 bytes | ~200 bytes |
+| With `ARDA_NO_TASK_RECOVERY` | ~35 bytes | ~560 bytes | ~280 bytes |
+| Both disabled | ~19 bytes | ~304 bytes | ~152 bytes |
 
-Defining `ARDA_NO_NAMES` saves `ARDA_MAX_NAME_LEN` bytes per task (default 16 bytes).
+`ARDA_TASK_RECOVERY` adds 6 bytes/task (recover pointer + timeout field).
 
 ### Where the RAM Goes
 
-Per task (approximate; padding varies by architecture):
-- `name[ARDA_MAX_NAME_LEN]`: `ARDA_MAX_NAME_LEN` bytes (omitted when `ARDA_NO_NAMES` is defined)
-- `setup/loop/teardown` pointers: 3 * pointer size (2 bytes on AVR, 4 bytes on 32-bit)
-- `interval/lastRun/timeout`: 3 * 4 bytes
+Per task on AVR (with `ARDA_TASK_RECOVERY`, which is default):
+- `name[ARDA_MAX_NAME_LEN]`: 16 bytes (omitted when `ARDA_NO_NAMES` is defined)
+- `setup/loop/teardown/recover` pointers: 4 × 2 bytes = 8 bytes
+- `interval/lastRun/timeout`: 3 × 4 bytes = 12 bytes
 - `runCount/nextFree` union: 4 bytes
-- `flags`: 1 byte (bits 0-1: state, bit 2: ranThisCycle, bit 3: inYield if `ARDA_YIELD` is defined, bits 4-6: priority, bit 7: reserved). When `ARDA_NO_NAMES` is defined, state value 3 indicates a deleted slot.
+- `flags`: 1 byte
 
 **Note:** Priority uses bits 4-6 of the existing flags byte, so it adds **zero memory overhead** per task.
 
@@ -832,17 +888,11 @@ Global scheduler overhead (one-time):
 - Small counters/flags (task count, active count, free list head, current task, callback depth)
 - Optional callbacks (timeout/start failure/trace pointers)
 
-### Platform-Specific Notes
+### ATmega328 (Arduino Uno/Nano)
 
-**ESP8266/ESP32:**
-- Much more RAM available, so default settings are fine
-- Consider increasing `ARDA_MAX_TASKS` if needed
-- Watch for stack overflow with deeply nested yields if using `ARDA_YIELD` (larger stack frames)
-- WiFi callbacks may interfere - use volatile flags for ISR communication
-
-**ATmega328 (Arduino Uno/Nano):**
-- Only 2KB RAM - reduce `ARDA_MAX_TASKS` and `ARDA_MAX_NAME_LEN` if tight
-- Keep task local variables small (< 50 bytes)—if using `ARDA_YIELD`, `yield()` keeps your stack frame live while other tasks run
+With only 2KB RAM, memory optimization is critical:
+- Reduce `ARDA_MAX_TASKS` and `ARDA_MAX_NAME_LEN` if tight on RAM
+- Keep task local variables small (< 50 bytes). If using `ARDA_YIELD`, `yield()` keeps your stack frame live while other tasks run
 - If using `ARDA_YIELD`, avoid `yield()` in tasks with large local buffers; use global/static storage instead
 - Consider `ARDA_MAX_TASKS 8` and `ARDA_MAX_NAME_LEN 12` for minimal footprint
 - Define `ARDA_NO_PRIORITY` to save ~100-200 bytes of code (removes priority-scanning loop)
@@ -944,7 +994,7 @@ TASK_LOOP(longTask) {
 
 ### Why yield() is Dangerous
 
-**`yield()` runs other tasks inside your stack frame.** Unlike preemptive multitasking, Arda does not give each task its own stack. When you call `yield()`, other tasks execute as nested function calls—your local variables remain on the stack the entire time. This can silently exhaust stack memory on constrained MCUs:
+`yield()` runs other tasks inside your stack frame. Unlike preemptive multitasking, Arda does not give each task its own stack. When you call `yield()`, other tasks execute as nested function calls. Your local variables remain on the stack the entire time. This can silently exhaust stack memory on constrained MCUs:
 
 ```cpp
 // DANGEROUS on ATmega328 (2KB RAM):
@@ -970,7 +1020,158 @@ TASK_LOOP(badTask) {
 
 ### yield() in setup/teardown
 
-Calling `yield()` from `setup()` or `teardown()` callbacks is supported but may produce surprising behavior—other tasks will execute in the middle of your task's initialization or cleanup. Generally avoid this unless you have a specific reason.
+Calling `yield()` from `setup()` or `teardown()` callbacks is supported but may produce surprising behavior: other tasks will execute in the middle of your task's initialization or cleanup. Generally avoid this unless you have a specific reason.
+
+## Appendix: Task Recovery (Soft Watchdog, AVR)
+
+On supported AVR platforms, Arda provides a "soft watchdog" that can forcibly abort stuck tasks without resetting the entire MCU. This feature is **enabled by default** on AVR boards with Timer2 support (Uno, Mega, Nano, Pro Mini, etc.).
+
+### How It Works
+
+- Uses Timer2 and `setjmp`/`longjmp` to abort tasks that exceed their timeout
+- When a task's `loop()` exceeds its timeout, execution jumps back to the scheduler
+- The optional `recover` callback runs to clean up partial state
+- The task remains in Running state - it will automatically retry `loop()` on the next scheduler cycle
+- To permanently stop a misbehaving task, call `stopTask()` from within `recover()`
+- Other tasks continue running normally - no MCU reset required
+
+### Basic Usage
+
+```cpp
+#include "Arda.h"
+
+void sensor_recover() {
+    // Called after forced abort - clean up partial state
+    resetSensorState();
+}
+
+void setup() {
+    // Create task with timeout and recovery in one call:
+    // name, setup, loop, interval, teardown, autoStart, priority, timeout, recover
+    int8_t id = OS.createTask("sensor", sensor_setup, sensor_loop,
+                              100, nullptr, true, TaskPriority::Normal,
+                              50, sensor_recover);  // 50ms timeout
+    OS.begin();
+}
+```
+
+You can also set timeout and recover separately after task creation:
+
+```cpp
+void setup() {
+    int8_t id = OS.createTask("sensor", sensor_setup, sensor_loop, 100);
+    OS.setTaskTimeout(id, 50);              // Abort if loop() takes > 50ms
+    OS.setTaskRecover(id, sensor_recover);  // Optional cleanup callback
+    OS.begin();
+}
+```
+
+### Stopping Misbehaving Tasks
+
+The recovery callback can take action beyond just cleanup - for example, stopping a task that keeps timing out:
+
+```cpp
+int8_t sensorTaskId = -1;
+int abortCount = 0;
+
+void sensor_recover() {
+    abortCount++;
+    resetSensorState();
+
+    // After 3 aborts, assume hardware is broken - stop the task
+    if (abortCount >= 3) {
+        OS.stopTask(sensorTaskId);
+        logError("Sensor task disabled after repeated timeouts");
+    }
+}
+
+void setup() {
+    sensorTaskId = OS.createTask("sensor", sensor_setup, sensor_loop,
+                                 100, nullptr, true, TaskPriority::Normal,
+                                 50, sensor_recover);  // 50ms timeout
+    OS.begin();
+}
+```
+
+This pattern is useful for tasks that interact with external hardware that may become unresponsive.
+
+### Adjusting Timeout Mid-Loop
+
+A task can adjust its own timeout during execution. This is useful for known-slow operations that shouldn't trigger recovery:
+
+```cpp
+void someTask_loop() {
+    doQuickWork();  // Normal timeout applies
+
+    // Extend timeout for a known-slow operation
+    uint32_t oldTimeout = OS.getTaskTimeout(myTaskId);
+    OS.setTaskTimeout(myTaskId, 500);  // Allow 500ms for this part
+
+    performSlowOperation();  // Won't be aborted
+
+    OS.setTaskTimeout(myTaskId, oldTimeout);  // Restore original
+
+    doMoreQuickWork();  // Original timeout applies again
+}
+```
+
+Setting timeout to 0 disables recovery for the remainder of the current loop() call.
+
+### Runtime Enable/Disable
+
+Task recovery can also be disabled globally for known-slow operations:
+
+```cpp
+void someTask_loop() {
+    // Temporarily disable for a known-slow operation
+    bool wasEnabled = OS.isTaskRecoveryEnabled();
+    OS.setTaskRecoveryEnabled(false);
+
+    performSlowOperation();  // Won't trigger recovery
+
+    OS.setTaskRecoveryEnabled(wasEnabled);
+}
+```
+
+Or disabled during initialization:
+
+```cpp
+void setup() {
+    OS.setTaskRecoveryEnabled(false);  // Disable during init
+    // ... create tasks, configure hardware ...
+    OS.begin();
+    OS.setTaskRecoveryEnabled(true);   // Re-enable after system is stable
+}
+```
+
+### Disabling at Compile Time
+
+To disable task recovery entirely (saves ~200 bytes of code):
+
+```cpp
+#define ARDA_NO_TASK_RECOVERY
+#include "Arda.h"
+```
+
+### Platform Support
+
+Task recovery is enabled by default on all platforms. The timeout API (`setTaskTimeout`, `getTaskTimeout`, timeout callbacks) works everywhere. Hardware abort (forcibly stopping stuck tasks via Timer2) is only available on AVR with Timer2 (Uno, Mega, Nano, Pro Mini, etc.). Use `isTaskRecoveryAvailable()` to check if hardware abort is supported.
+
+### Mutual Exclusion (Hardware Abort Only)
+
+The hardware abort feature (AVR with Timer2) cannot be used with:
+- `ARDA_YIELD` - yield corrupts the jump context used by setjmp/longjmp
+- `ARDA_NO_GLOBAL_INSTANCE` - Timer2 ISR requires the global `OS` instance
+
+These restrictions do not apply to the soft timeout API (`setTaskTimeout`, `getTaskTimeout`, timeout callbacks), which works on all platforms regardless of these defines.
+
+`ARDA_WATCHDOG` can be used alongside task recovery as a backup. Task recovery aborts individual stuck tasks; if that fails, the watchdog resets the MCU.
+
+### PWM Conflict (Arduino Uno)
+
+On ATmega328P boards (Uno, Nano, Pro Mini), Timer2 also controls PWM output on pins 3 and 11. When hardware abort is active, `analogWrite()` on these pins will not work correctly. PWM on pins 5, 6, 9, and 10 is unaffected.
+
+To restore PWM on pins 3 and 11 at runtime, call `OS.setTaskRecoveryEnabled(false)`. This disables the Timer2 interrupt, allowing normal PWM operation on those pins (at the cost of losing hardware abort protection).
 
 ## Appendix: Hardware Watchdog (AVR)
 
@@ -1023,10 +1224,7 @@ void longTask_loop() {
 
 ### Platform Support
 
-| Platform | Watchdog Status |
-|----------|-----------------|
-| AVR (Uno, Mega, Nano, etc.) | Opt-in, 8s timeout |
-| ESP8266, ESP32, SAMD, RP2040 | Not supported |
+Hardware watchdog is AVR-only. On non-AVR platforms, this feature is not available.
 
 ## License
 
