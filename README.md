@@ -12,7 +12,7 @@ In cooperative multitasking, a single misbehaving task can freeze your entire sy
 
 On AVR with Timer2, Arda is capable of **hard aborts**: forcibly terminating a stuck task without resetting the MCU. No other Arduino scheduler I'm aware of can do this. On a tiny 8-bit MCU with 2KB of RAM, that's basically black magic — a taste of preemptive multitasking where it shouldn't exist.
 
-When a task exceeds its timeout, Timer2 fires and uses `setjmp`/`longjmp` to jump back to the scheduler. The current `loop()` is aborted, an optional recovery callback runs for cleanup, and the scheduler continues. The task remains Running and will retry next cycle (or the recovery callback can stop it). No reset, no lost state, no frozen system. Even if you don't need multitasking, self-recovering sketches is a neat enough trick.
+When a task exceeds its timeout, Timer2 fires and uses `setjmp`/`longjmp` to jump back to the scheduler. The current `loop()` is aborted, an optional recovery callback runs for cleanup, and the scheduler continues. The task remains Running and will retry next cycle (or the recovery callback can stop it). No reset, no lost state, no frozen system. Even if you don't need multitasking, self-recovering sketches are a neat enough trick.
 
 Example:
 
@@ -177,9 +177,11 @@ Key points:
 
 | Method | Description |
 |--------|-------------|
-| `createTask(name, setup, loop, interval, teardown, autoStart)` | Register a new task. Returns task ID (-1 on failure). Name must be non-empty, max 15 chars, and is **case-sensitive**. If `begin()` was called and `autoStart` is true (default), task auto-starts immediately; on start failure, task is deleted and -1 is returned (check `getError()`). Set `autoStart=false` to create in STOPPED state and handle start failures manually. When `ARDA_NO_NAMES` is defined, name is ignored; use the nameless `createTask(setup, loop, interval, teardown, autoStart)` overload instead. **Warning:** `interval=0` with high priority will starve all lower-priority tasks, so ensure such tasks return quickly. |
+| `createTask(name, setup, loop, interval, teardown, autoStart)` | Register a new task. Returns task ID (-1 on failure). Name must be non-empty, max `ARDA_MAX_NAME_LEN-1` chars (default 15), and is **case-sensitive**. If `begin()` was called and `autoStart` is true (default), task auto-starts immediately; on start failure, task is deleted and -1 is returned (check `getError()`). Set `autoStart=false` to create in STOPPED state and handle start failures manually. When `ARDA_NO_NAMES` is defined, name is ignored; use the nameless `createTask(setup, loop, interval, teardown, autoStart)` overload instead. **Warning:** `interval=0` with high priority will starve all lower-priority tasks, so ensure such tasks return quickly. |
+| `createTask(name, setup, loop, interval, teardown, autoStart, priority)` | Create a task with explicit priority. See `TaskPriority` enum for levels (`Lowest` through `Highest`). Not available if `ARDA_NO_PRIORITY` is defined. |
+| `createTask(name, setup, loop, interval, teardown, autoStart, priority, timeout, recover)` | Create a task with priority, timeout, and recovery callback. `timeout`: max execution time in ms (0 = disabled). `recover`: called after forced timeout abort (can be nullptr). Requires `ARDA_TASK_RECOVERY` and `ARDA_NO_PRIORITY` must not be defined. |
 | `deleteTask(id)` | Delete a stopped task, freeing its slot for reuse. Cannot delete currently executing task. |
-| `killTask(id)` | Stop and delete a task in one call. Convenience for `stopTask(id)` then `deleteTask(id)`. Returns false if stop fails or teardown changes state (task remains in whatever state teardown left it). |
+| `killTask(id)` | Stop and delete a task in one call. Convenience for `stopTask(id)` then `deleteTask(id)`. Returns false if stop fails or teardown changes state (task remains in whatever state teardown left it). Also fails for invalid IDs or if the task is currently executing. |
 | `startTask(id, runImmediately)` | Start a stopped task (runs setup callback). Returns `StartResult` enum - see below. Set `runImmediately=true` to skip the initial interval wait for interval-based tasks; `false` (default) waits one full interval. Note: Tasks started during a run() cycle run on the next cycle regardless of this flag. Resets `runCount` to 0. |
 | `pauseTask(id)` | Pause a running task |
 | `resumeTask(id)` | Resume a paused task |
@@ -189,8 +191,8 @@ Key points:
 | `heartbeat()` | Reset the current task's timeout timer to its configured value. Useful for long-running tasks that want to signal progress without changing their timeout setting. Returns false if called outside task context or task has no timeout configured. **AVR only** (requires hardware timer support). |
 | `setTaskRecover(id, cb)` | Set recovery callback for a task (called after forced timeout abort). Requires `ARDA_TASK_RECOVERY` and hardware support (AVR with Timer2); returns false with `NotSupported` on other platforms. |
 | `hasTaskRecover(id)` | Check if a task has a recovery callback. Requires `ARDA_TASK_RECOVERY` and hardware support; returns false on other platforms. |
-| `setTaskRecoveryEnabled(enabled)` | Enable/disable task recovery globally at runtime. Returns false if hardware doesn't support it. Requires `ARDA_TASK_RECOVERY`. |
-| `isTaskRecoveryEnabled()` | Check if task recovery is currently enabled AND available. Requires `ARDA_TASK_RECOVERY`. |
+| `setTaskRecoveryEnabled(enabled)` | Enable/disable task recovery globally at runtime. Requires `ARDA_TASK_RECOVERY`. On non-AVR this controls soft timeouts and callbacks. |
+| `isTaskRecoveryEnabled()` | Check if task recovery is currently enabled. Requires `ARDA_TASK_RECOVERY`. Hardware availability is reported by `isTaskRecoveryAvailable()`. On non-AVR, this flag only controls soft timeouts and callbacks. |
 | `setTaskPriority(id, priority)` | Set task priority (`TaskPriority` enum). Returns false with `InvalidValue` if invalid. Not available if `ARDA_NO_PRIORITY` is defined. |
 | `getTaskPriority(id)` | Get task priority. Returns `TaskPriority::Lowest` for invalid tasks. Not available if `ARDA_NO_PRIORITY` is defined. |
 | `setTaskInterval(id, ms, resetTiming)` | Change a task's execution interval at runtime. By default (`resetTiming=false`), keeps existing timing (next run based on lastRun + new interval). Set `resetTiming=true` to reset timing so task waits the full new interval from now. |
@@ -484,8 +486,9 @@ Arda includes a built-in serial shell task (at ID 0) for runtime task management
 | `r <id>` | Resume task |
 | `k <id>` | Kill task (stop + delete in one command) |
 | `d <id>` | Delete task (must be stopped first) |
-| `l` | List tasks (format: `ID STATE NAME`, e.g., `0 R sh`) |
+| `l` | List tasks (format: `ID STATE NAME`, e.g., `0 R sh`). When `ARDA_NO_NAMES` is defined, name is omitted. |
 | `h` or `?` | Help (list commands) |
+| `o 0\|1` | Set echo off/on (shows current state if no argument). Not available with `ARDA_NO_SHELL_ECHO`. |
 
 **Extended commands (not available with `ARDA_SHELL_MINIMAL`):**
 
@@ -503,7 +506,6 @@ Arda includes a built-in serial shell task (at ID 0) for runtime task management
 | `m` | Memory info (task count, max tasks, slots used) |
 | `u` | Uptime (seconds since begin()) |
 | `v` | Arda version |
-| `o 0\|1` | Set echo off/on (shows current state) |
 
 **State codes in `l` output:** `R` = Running, `P` = Paused, `S` = Stopped
 
@@ -518,8 +520,8 @@ Arda includes a built-in serial shell task (at ID 0) for runtime task management
 ```
 
 ```cpp
-// Minimal shell - only core commands (b/s/p/r/k/d/l/h), saves ~200 bytes
-// Removes extended commands: i, w, a, y, n, g, e, c, m, u, v, o
+// Minimal shell - only core commands (b/s/p/r/k/d/l/h/o), saves ~200 bytes
+// Removes extended commands: i, w, a, t, y, n, g, e, c, m, u, v
 #define ARDA_SHELL_MINIMAL
 #include "Arda.h"
 ```
@@ -671,6 +673,7 @@ if (OS.isValidTask(taskId)) {
 | `ArdaError::InCallback` | Operation not allowed from current context (reset() from callback, or run() reentrancy) |
 | `ArdaError::NotSupported` | Feature disabled at compile time (e.g., `renameTask` when `ARDA_NO_NAMES` is defined) |
 | `ArdaError::InvalidValue` | Parameter value out of valid range (e.g., priority > 4) |
+| `ArdaError::TaskAborted` | Task was forcibly aborted due to timeout. Requires `ARDA_TASK_RECOVERY`. |
 
 ## Macros (Optional)
 
@@ -707,6 +710,7 @@ TASK_TEARDOWN(name)   // Define teardown function: void name_teardown()
 REGISTER_TASK(name, interval)  // Register task (discards returned ID)
 REGISTER_TASK_ID(id, name, interval)  // Register task and capture ID
 REGISTER_TASK_WITH_TEARDOWN(name, interval)
+REGISTER_TASK_ID_WITH_TEARDOWN(id, name, interval)
 ```
 
 ### Macros for Custom Scheduler Instances
@@ -722,6 +726,7 @@ Arda myScheduler;
 REGISTER_TASK_ON(myScheduler, blinker, 500);
 REGISTER_TASK_ID_ON(taskId, myScheduler, reporter, 1000);
 REGISTER_TASK_ON_WITH_TEARDOWN(myScheduler, worker, 100);
+REGISTER_TASK_ID_ON_WITH_TEARDOWN(taskId, myScheduler, worker, 100);
 ```
 
 ## Timing Behavior

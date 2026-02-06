@@ -433,7 +433,7 @@ void Arda::runInternal(int8_t skipTask) {
             emitTrace(i, TraceEvent::TaskLoopBegin);
             uint32_t execStart = millis();
 
-            // ARDA_WATCHDOG and ARDA_TASK_RECOVERY are mutually exclusive (compile-time error)
+            // ARDA_WATCHDOG and ARDA_TASK_RECOVERY can be enabled together
 #ifdef ARDA_WATCHDOG
             wdt_reset();
 #endif
@@ -608,7 +608,7 @@ void Arda::runInternal(int8_t skipTask) {
             emitTrace(i, TraceEvent::TaskLoopBegin);
             uint32_t execStart = millis();
 
-            // ARDA_WATCHDOG and ARDA_TASK_RECOVERY are mutually exclusive (compile-time error)
+            // ARDA_WATCHDOG and ARDA_TASK_RECOVERY can be enabled together
 #ifdef ARDA_WATCHDOG
             wdt_reset();
 #endif

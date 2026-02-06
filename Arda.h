@@ -14,8 +14,8 @@
 // Version info
 #define ARDA_VERSION_MAJOR 1
 #define ARDA_VERSION_MINOR 2
-#define ARDA_VERSION_PATCH 0
-#define ARDA_VERSION_STRING "1.2.0"
+#define ARDA_VERSION_PATCH 1
+#define ARDA_VERSION_STRING "1.2.1"
 
 // Configuration constants - adjust these to tune memory usage vs capability
 #ifndef ARDA_MAX_TASKS
@@ -42,7 +42,7 @@
 // #define ARDA_NO_NAMES                // Disable task names (saves ARDA_MAX_NAME_LEN bytes per task)
 // #define ARDA_NO_SHELL                // Disable built-in shell task entirely
 // #define ARDA_SHELL_MANUAL_START      // Don't auto-start shell in begin()
-// #define ARDA_SHELL_MINIMAL           // Only core commands (p/r/s/t/d/l/h)
+// #define ARDA_SHELL_MINIMAL           // Only core commands (b/s/p/r/k/d/l/h/o)
 // #define ARDA_NO_TASK_RECOVERY        // Disable soft watchdog (AVR only, auto-enabled by default)
 // #define ARDA_WATCHDOG                // Enable hardware watchdog (AVR only, opt-in, resets entire MCU)
 // #define ARDA_YIELD                   // Enable yield() - USE WITH CAUTION (see README)
@@ -149,7 +149,7 @@ typedef void (*TimeoutCallback)(int8_t taskId, uint32_t actualDurationMs);
 #endif
 typedef void (*StartFailureCallback)(int8_t taskId, ArdaError error);
 
-// Debug/trace events for monitoring task lifecycle (9 events).
+// Debug/trace events for monitoring task lifecycle (11 events).
 // Note: "ing" variants (TaskStarting, TaskStopping) bracket user callbacks (setup/teardown).
 // Pause/resume have no callbacks, so only "ed" variants exist - no code runs between states.
 enum class TraceEvent : uint8_t {
@@ -390,11 +390,11 @@ public:
 
     // Enable/disable task recovery globally
     // When disabled, tasks run without timeout protection even if timeout is set
-    // Returns true if successful, false if hardware doesn't support task recovery
+    // On non-AVR this controls soft timeouts and callbacks
     bool setTaskRecoveryEnabled(bool enabled);
 
-    // Check if task recovery is currently enabled AND available
-    // Returns false if hardware doesn't support it OR if disabled via setTaskRecoveryEnabled()
+    // Check if task recovery is currently enabled
+    // On non-AVR this controls soft timeouts and callbacks only
     bool isTaskRecoveryEnabled() const;
 #endif
 

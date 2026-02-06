@@ -2071,8 +2071,8 @@ void test_version_constants() {
     // Verify version constants are defined and accessible
     assert(ARDA_VERSION_MAJOR == 1);
     assert(ARDA_VERSION_MINOR == 2);
-    assert(ARDA_VERSION_PATCH == 0);
-    assert(strncmp(ARDA_VERSION_STRING, "1.2.0", 16) == 0);
+    assert(ARDA_VERSION_PATCH == 1);
+    assert(strncmp(ARDA_VERSION_STRING, "1.2.1", 16) == 0);
 
     printf("PASSED\n");
 }
